@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import resource
+import subprocess
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 
 
 app = FastAPI(title="colloc-webui-backend")
@@ -391,6 +392,49 @@ async def autoload_preload_now() -> dict[str, Any]:
     return results
 
 
+@app.post("/api/system-reset")
+async def system_reset() -> dict[str, Any]:
+    """Trigger full system reset via configured reset backend. Output: status dict. Input: none."""
+    reset_mode = os.getenv("SYSTEM_RESET_MODE", "hook").strip().lower()
+    hook_url = os.getenv("SYSTEM_RESET_HOOK_URL", "").strip()
+    reset_command = os.getenv(
+        "SYSTEM_RESET_COMMAND",
+        "docker compose --profile core down && docker compose --profile core up -d",
+    ).strip()
+    reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
+
+    append_system_log("system", "reset.requested", "System reset requested via API.", {"mode": reset_mode})
+
+    if reset_mode == "hook":
+        if not hook_url:
+            raise HTTPException(status_code=503, detail="SYSTEM_RESET_HOOK_URL is not configured")
+        timeout = httpx.Timeout(15.0, connect=3.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(hook_url, json={"source": "webui-backend", "requested_at": time.time()})
+                resp.raise_for_status()
+            append_system_log("system", "reset.dispatched", "Reset request dispatched to hook.", {"hook_url": hook_url})
+            return {"status": "accepted", "mode": "hook", "message": "Reset hook accepted request."}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "reset.error", f"Reset hook failed: {exc}", {"hook_url": hook_url})
+            raise HTTPException(status_code=502, detail=f"Reset hook failed: {exc}") from exc
+
+    if reset_mode == "command":
+        try:
+            subprocess.Popen(
+                ["/bin/sh", "-lc", f"cd '{reset_cwd}' && ({reset_command})"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            append_system_log("system", "reset.dispatched", "Reset command started.", {"cwd": reset_cwd})
+            return {"status": "accepted", "mode": "command", "message": "Reset command started."}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "reset.error", f"Reset command failed: {exc}", {"cwd": reset_cwd})
+            raise HTTPException(status_code=500, detail=f"Reset command failed: {exc}") from exc
+
+    raise HTTPException(status_code=400, detail="Unsupported SYSTEM_RESET_MODE. Use 'hook' or 'command'.")
+
+
 @app.get("/api/runtime")
 def get_runtime() -> dict[str, object]:
     """Return backend runtime snapshot. Output: runtime dict. Input: none."""
@@ -525,6 +569,18 @@ async def websocket_session(websocket: WebSocket) -> None:
                     await websocket.send_json({"type": "error", "message": "voice.utterance: audio_b64 is empty."})
                     continue
 
+                append_system_log(
+                    "stt",
+                    "start",
+                    "STT transcription started.",
+                    {
+                        "source": "voice",
+                        "mime_type": mime_type,
+                        "language_hint": msg.get("language_hint"),
+                        "audio_b64_chars": len(audio_b64),
+                    },
+                )
+
                 stt_result = await _call_stt(audio_b64, mime_type, msg.get("language_hint"))
                 if stt_result.get("error"):
                     append_system_log(
@@ -539,6 +595,11 @@ async def websocket_session(websocket: WebSocket) -> None:
                             "status_code": stt_result.get("status_code"),
                             "response_detail": stt_result.get("response_detail", ""),
                             "response_preview": stt_result.get("response_preview", ""),
+                            "provider": stt_result.get("provider", ""),
+                            "device": stt_result.get("device", ""),
+                            "device_runtime": stt_result.get("device_runtime", ""),
+                            "compute_type": stt_result.get("compute_type", ""),
+                            "timings_ms": stt_result.get("timings_ms", {}),
                         },
                     )
                     await websocket.send_json(
@@ -560,6 +621,11 @@ async def websocket_session(websocket: WebSocket) -> None:
                         "chars": len(transcript),
                         "text_preview": transcript[:200],
                         "placeholder": stt_placeholder,
+                        "provider": stt_result.get("provider", ""),
+                        "device": stt_result.get("device", ""),
+                        "device_runtime": stt_result.get("device_runtime", ""),
+                        "compute_type": stt_result.get("compute_type", ""),
+                        "timings_ms": stt_result.get("timings_ms", {}),
                     },
                 )
                 await websocket.send_json({"type": "stt.result", "text": transcript, "source": "voice"})
@@ -606,6 +672,11 @@ async def _call_stt(audio_b64: str, mime_type: str, language_hint: str | None) -
             body = resp.json()
             return {
                 "transcript": body.get("transcript", ""),
+                "provider": str(body.get("provider", {}).get("primary", "")),
+                "device": str(body.get("provider", {}).get("device", "")),
+                "device_runtime": str(body.get("provider", {}).get("device_runtime", "")),
+                "compute_type": str(body.get("provider", {}).get("compute_type", "")),
+                "timings_ms": body.get("timings_ms", {}),
                 "error": "",
                 "status_code": resp.status_code,
                 "response_detail": "",
@@ -621,6 +692,11 @@ async def _call_stt(audio_b64: str, mime_type: str, language_hint: str | None) -
             response_detail = ""
         return {
             "transcript": "",
+            "provider": "",
+            "device": "",
+            "device_runtime": "",
+            "compute_type": "",
+            "timings_ms": {},
             "error": f"HTTP {exc.response.status_code} from STT service",
             "status_code": exc.response.status_code,
             "response_detail": response_detail,
@@ -630,6 +706,11 @@ async def _call_stt(audio_b64: str, mime_type: str, language_hint: str | None) -
         exc_msg = repr(exc) if not str(exc) else str(exc)
         return {
             "transcript": "",
+            "provider": "",
+            "device": "",
+            "device_runtime": "",
+            "compute_type": "",
+            "timings_ms": {},
             "error": f"STT transport error: {exc_msg}",
             "status_code": None,
             "response_detail": "",
@@ -638,6 +719,11 @@ async def _call_stt(audio_b64: str, mime_type: str, language_hint: str | None) -
     except Exception as exc:  # noqa: BLE001
         return {
             "transcript": "",
+            "provider": "",
+            "device": "",
+            "device_runtime": "",
+            "compute_type": "",
+            "timings_ms": {},
             "error": f"Unexpected STT error: {exc}",
             "status_code": None,
             "response_detail": "",

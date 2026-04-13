@@ -20,7 +20,47 @@ REQUESTS_BY_PATH: dict[str, int] = defaultdict(int)
 _MODEL: WhisperModel | None = None
 _MODEL_KEY: tuple[str, str, str] | None = None
 _MODEL_LOCK = Lock()
+_MODEL_RUNTIME_DEVICE = ""
 LOGGER = logging.getLogger("colloc.stt")
+LOGGER.setLevel(logging.INFO)
+_TIMING_HISTORY_LIMIT = max(10, int(os.getenv("STT_TIMING_HISTORY_LIMIT", "200")))
+_TIMING_HISTORY: dict[str, list[float]] = defaultdict(list)
+
+
+def _record_timing(stage: str, duration_ms: float) -> None:
+    """Record one stage duration sample. Output: none. Input: stage and duration in ms."""
+    values = _TIMING_HISTORY[stage]
+    values.append(max(0.0, float(duration_ms)))
+    if len(values) > _TIMING_HISTORY_LIMIT:
+        del values[: len(values) - _TIMING_HISTORY_LIMIT]
+
+
+def _pctl(values: list[float], p: float) -> float:
+    """Compute percentile for a sorted sample list. Output: value. Input: sorted list and percentile [0..1]."""
+    if not values:
+        return 0.0
+    idx = int((len(values) - 1) * p)
+    return round(values[idx], 2)
+
+
+def _timing_metrics_snapshot() -> dict[str, dict[str, float | int]]:
+    """Build timing metrics snapshot. Output: stage metrics. Input: none."""
+    metrics: dict[str, dict[str, float | int]] = {}
+    for stage, samples in _TIMING_HISTORY.items():
+        if not samples:
+            continue
+        last_ms = round(samples[-1], 2)
+        sorted_samples = sorted(samples)
+        avg_ms = round(sum(sorted_samples) / len(sorted_samples), 2)
+        metrics[stage] = {
+            "samples": len(sorted_samples),
+            "last_ms": last_ms,
+            "avg_ms": avg_ms,
+            "p50_ms": _pctl(sorted_samples, 0.50),
+            "p95_ms": _pctl(sorted_samples, 0.95),
+            "max_ms": round(sorted_samples[-1], 2),
+        }
+    return metrics
 
 
 class TranscriptionRequest(BaseModel):
@@ -33,12 +73,15 @@ class TranscriptionRequest(BaseModel):
 
 def get_active_provider() -> dict[str, str]:
     """Get active provider info. Output: provider dict. Input: none."""
+    configured_device = os.getenv("STT_DEVICE", "cpu").strip().lower() or "cpu"
     return {
         "primary": os.getenv("STT_PROVIDER_PRIMARY", ""),
         "fallback": os.getenv("STT_PROVIDER_FALLBACK", ""),
         "model": os.getenv("STT_MODEL", "large-v3-turbo"),
         "external_url": os.getenv("STT_EXTERNAL_URL", ""),
-        "device": os.getenv("STT_DEVICE", "cpu"),
+        "device": configured_device,
+        "device_configured": configured_device,
+        "device_runtime": _MODEL_RUNTIME_DEVICE,
         "compute_type": os.getenv("STT_COMPUTE_TYPE", "int8"),
     }
 
@@ -50,7 +93,7 @@ def get_memory_usage_mb() -> float:
 
 def get_whisper_model() -> WhisperModel:
     """Get cached Whisper model instance. Output: WhisperModel. Input: none."""
-    global _MODEL, _MODEL_KEY
+    global _MODEL, _MODEL_KEY, _MODEL_RUNTIME_DEVICE
     hf_home = os.getenv("HF_HOME", "/tmp/huggingface")
     os.environ.setdefault("HF_HOME", hf_home)
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", f"{hf_home}/hub")
@@ -72,8 +115,24 @@ def get_whisper_model() -> WhisperModel:
         if _MODEL is not None and _MODEL_KEY == model_key:
             return _MODEL
         os.makedirs(download_root, exist_ok=True)
-        _MODEL = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=download_root)
-        _MODEL_KEY = model_key
+        try:
+            _MODEL = WhisperModel(model_name, device=device, compute_type=compute_type, download_root=download_root)
+            _MODEL_KEY = model_key
+            _MODEL_RUNTIME_DEVICE = device
+        except Exception as exc:
+            if device == "cuda":
+                LOGGER.warning("stt.model.init failed on cuda, falling back to cpu: %s", exc)
+                fallback_compute_type = os.getenv("STT_CPU_COMPUTE_TYPE", "int8")
+                _MODEL = WhisperModel(
+                    model_name,
+                    device="cpu",
+                    compute_type=fallback_compute_type,
+                    download_root=download_root,
+                )
+                _MODEL_KEY = (model_name, "cpu", fallback_compute_type)
+                _MODEL_RUNTIME_DEVICE = "cpu"
+            else:
+                raise
         return _MODEL
 
 
@@ -135,15 +194,23 @@ def _mime_to_ext(mime_type: str | None) -> str:
 
 async def transcribe_faster_whisper(request: TranscriptionRequest) -> dict[str, Any]:
     """Transcribe audio locally with faster-whisper. Output: STT response dict. Input: transcription request."""
-    audio_bytes = await load_audio_bytes(request)
-    provider = get_active_provider()
-    model = get_whisper_model()
+    total_started_at = time.perf_counter()
 
-    beam_size = int(os.getenv("STT_BEAM_SIZE", "1" if request.partial else "5"))
+    stage_started_at = time.perf_counter()
+    audio_bytes = await load_audio_bytes(request)
+    load_audio_ms = (time.perf_counter() - stage_started_at) * 1000.0
+
+    stage_started_at = time.perf_counter()
+    model = get_whisper_model()
+    provider = get_active_provider()
+    model_prepare_ms = (time.perf_counter() - stage_started_at) * 1000.0
+
+    beam_size = int(os.getenv("STT_BEAM_SIZE", "5"))
     vad_filter = os.getenv("STT_VAD_FILTER", "true").lower() == "true"
     ext = _mime_to_ext(request.mime_type)
 
     try:
+        stage_started_at = time.perf_counter()
         with tempfile.NamedTemporaryFile(suffix=ext, delete=True) as tmp:
             tmp.write(audio_bytes)
             tmp.flush()
@@ -156,8 +223,22 @@ async def transcribe_faster_whisper(request: TranscriptionRequest) -> dict[str, 
                 without_timestamps=True,
             )
             transcript = " ".join(segment.text.strip() for segment in segments if segment.text.strip()).strip()
+        transcribe_ms = (time.perf_counter() - stage_started_at) * 1000.0
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"faster-whisper transcription failed: {exc}") from exc
+
+    total_ms = (time.perf_counter() - total_started_at) * 1000.0
+    timings_ms = {
+        "load_audio_ms": round(load_audio_ms, 2),
+        "model_prepare_ms": round(model_prepare_ms, 2),
+        "transcribe_ms": round(transcribe_ms, 2),
+        "total_ms": round(total_ms, 2),
+    }
+
+    _record_timing("load_audio_ms", load_audio_ms)
+    _record_timing("model_prepare_ms", model_prepare_ms)
+    _record_timing("transcribe_ms", transcribe_ms)
+    _record_timing("total_ms", total_ms)
 
     audio_source = "b64" if request.audio_b64 else ("url" if request.audio_url else "none")
     return {
@@ -168,6 +249,7 @@ async def transcribe_faster_whisper(request: TranscriptionRequest) -> dict[str, 
         "partial": request.partial,
         "detected_language": getattr(info, "language", None),
         "detected_language_probability": getattr(info, "language_probability", None),
+        "timings_ms": timings_ms,
         "transcript": transcript,
     }
 
@@ -214,8 +296,11 @@ def metrics() -> dict[str, object]:
             "stt_model": provider["model"],
             "external_stt_url": provider["external_url"],
             "stt_device": provider["device"],
+            "stt_device_configured": provider["device_configured"],
+            "stt_device_runtime": provider["device_runtime"],
             "stt_compute_type": provider["compute_type"],
         },
+        "timings_ms": _timing_metrics_snapshot(),
     }
 
 
@@ -235,11 +320,13 @@ async def transcribe(request: TranscriptionRequest) -> dict[str, object]:
     audio_source = "b64" if request.audio_b64 else ("url" if request.audio_url else "none")
     audio_size = len(request.audio_b64 or "") if request.audio_b64 else 0
 
-    LOGGER.info(
-        "stt.task.accepted provider=%s model=%s device=%s compute_type=%s source=%s mime_type=%s audio_b64_chars=%s partial=%s",
+    LOGGER.warning(
+        "stt.task.accepted provider=%s model=%s device_configured=%s device_resolved=%s device_runtime=%s compute_type=%s source=%s mime_type=%s audio_b64_chars=%s partial=%s",
         primary,
         provider.get("model", ""),
+        provider.get("device_configured", ""),
         provider.get("device", ""),
+        provider.get("device_runtime", ""),
         provider.get("compute_type", ""),
         audio_source,
         request.mime_type,
@@ -250,17 +337,25 @@ async def transcribe(request: TranscriptionRequest) -> dict[str, object]:
     if primary == "external":
         result = await transcribe_external(request)
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        LOGGER.info("stt.task.completed provider=external elapsed_ms=%.1f", elapsed_ms)
+        LOGGER.warning(
+            "stt.task.completed provider=external elapsed_ms=%.1f device_runtime=%s",
+            elapsed_ms,
+            get_active_provider().get("device_runtime", ""),
+        )
         return result
 
     try:
         result = await transcribe_faster_whisper(request)
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
         transcript_len = len(str(result.get("transcript", "")))
-        LOGGER.info(
-            "stt.task.completed provider=faster_whisper elapsed_ms=%.1f transcript_chars=%s",
+        timings = result.get("timings_ms", {})
+        runtime_device = str(result.get("provider", {}).get("device_runtime", ""))
+        LOGGER.warning(
+            "stt.task.completed provider=faster_whisper elapsed_ms=%.1f transcript_chars=%s device_runtime=%s timings_ms=%s",
             elapsed_ms,
             transcript_len,
+            runtime_device,
+            timings,
         )
         return result
     except HTTPException as exc:
@@ -270,11 +365,17 @@ async def transcribe(request: TranscriptionRequest) -> dict[str, object]:
             fallback_result["primary_error"] = exc.detail
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
             LOGGER.warning(
-                "stt.task.fallback provider=external elapsed_ms=%.1f primary_error=%s",
+                "stt.task.fallback provider=external elapsed_ms=%.1f device_runtime=%s primary_error=%s",
                 elapsed_ms,
+                get_active_provider().get("device_runtime", ""),
                 exc.detail,
             )
             return fallback_result
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        LOGGER.error("stt.task.failed elapsed_ms=%.1f error=%s", elapsed_ms, exc.detail)
+        LOGGER.error(
+            "stt.task.failed elapsed_ms=%.1f device_runtime=%s error=%s",
+            elapsed_ms,
+            get_active_provider().get("device_runtime", ""),
+            exc.detail,
+        )
         raise

@@ -35,7 +35,7 @@ services:
       - core
     depends_on:
       webui-backend:
-        condition: service_started
+        condition: service_healthy
       stt:
         condition: service_started
       tools:
@@ -162,9 +162,19 @@ services:
 
   stt:
     <<: *app-service
+    build:
+      context: .
+      dockerfile: Dockerfile.stt
     container_name: colloc-stt
     profiles:
       - core
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     command:
       - uvicorn
       - services.stt.app:app

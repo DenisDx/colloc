@@ -1,6 +1,7 @@
 const connectButton = document.getElementById("connect-btn");
 const startButton = document.getElementById("start-btn");
 const stopButton = document.getElementById("stop-btn");
+const resetSystemButton = document.getElementById("reset-system-btn");
 const playChunkButton = document.getElementById("play-chunk-btn");
 const stopPlaybackButton = document.getElementById("stop-playback-btn");
 const playbackStateNode = document.getElementById("playback-state");
@@ -995,11 +996,70 @@ async function playServerAudioSegments(segments) {
 // Update voice state label. Output: none. Input: state text.
 function setVoiceState(text) {
   voiceStateNode.textContent = `State: ${text}`;
+  syncControlButtons();
 }
 
 // Update microphone state label. Output: none. Input: state text.
 function setMicState(text) {
   micStateNode.textContent = `Microphone: ${text}`;
+  syncControlButtons();
+}
+
+// Check whether websocket session is currently connected. Output: boolean. Input: none.
+function isSessionConnected() {
+  return !!socket && socket.readyState === WebSocket.OPEN;
+}
+
+// Check whether websocket session is currently connecting. Output: boolean. Input: none.
+function isSessionConnecting() {
+  return !!socket && socket.readyState === WebSocket.CONNECTING;
+}
+
+// Check whether microphone recorder is currently active. Output: boolean. Input: none.
+function isMicrophoneRecording() {
+  return !!mediaRecorder && mediaRecorder.state === "recording";
+}
+
+// Update control button states based on session/microphone status. Output: none. Input: none.
+function syncControlButtons() {
+  if (connectButton) {
+    connectButton.disabled = isSessionConnected() || isSessionConnecting();
+  }
+  if (startButton) {
+    startButton.disabled = !isSessionConnected() || isMicrophoneRecording();
+  }
+  if (stopButton) {
+    stopButton.disabled = !isMicrophoneRecording();
+  }
+}
+
+// Request backend-triggered full system reset. Output: none. Input: none.
+async function resetSystem() {
+  if (!resetSystemButton) {
+    return;
+  }
+  const confirmed = window.confirm("This will trigger full system restart. Continue?");
+  if (!confirmed) {
+    return;
+  }
+
+  resetSystemButton.disabled = true;
+  try {
+    const response = await fetch("/api/system-reset", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: "manual-ui-request" }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.message || `HTTP ${response.status}`);
+    }
+    appendEvent(`System reset requested: ${payload.message || "accepted"}.`);
+  } catch (err) {
+    appendEvent(`System reset failed: ${err.message || err}`);
+  } finally {
+    resetSystemButton.disabled = false;
+  }
 }
 
 // Update playback state badge. Output: none. Input: state key and optional label.
@@ -1278,10 +1338,12 @@ function connectSession() {
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   socket = new WebSocket(`${protocol}//${window.location.host}/ws`);
   setVoiceState("connecting");
+  syncControlButtons();
 
   socket.addEventListener("open", () => {
     setVoiceState("connected");
     appendEvent("WebSocket connected.");
+    syncControlButtons();
   });
 
   socket.addEventListener("message", (event) => {
@@ -1331,13 +1393,18 @@ function connectSession() {
   });
 
   socket.addEventListener("close", () => {
+    if (isMicrophoneRecording()) {
+      stopMicrophone();
+    }
     setVoiceState("disconnected");
     appendEvent("WebSocket closed.");
+    syncControlButtons();
   });
 
   socket.addEventListener("error", () => {
     setVoiceState("error");
     appendEvent("WebSocket error.");
+    syncControlButtons();
   });
 }
 
@@ -1580,6 +1647,7 @@ async function startMicrophone() {
     startAudioVisualization();
     setMicState("recording");
     appendEvent("Microphone started.");
+    syncControlButtons();
   } catch (error) {
     setMicState("error");
     const details = error && error.message ? error.message : String(error);
@@ -1595,6 +1663,7 @@ async function startMicrophone() {
       appendEvent("Tip: getUserMedia API is missing in this runtime. Check browser privacy mode, policies, or preview sandbox.");
     }
     logAudioCapabilities("Microphone diagnostics");
+    syncControlButtons();
   }
 }
 
@@ -1633,6 +1702,7 @@ function stopMicrophone() {
   silentChunksInRow = 0;
   setMicState("stopped");
   appendEvent("Microphone stopped.");
+  syncControlButtons();
 
   if (utteranceActive && utteranceBlobs.length > 0) {
     utteranceActive = false;
@@ -1643,6 +1713,9 @@ function stopMicrophone() {
 connectButton.addEventListener("click", connectSession);
 startButton.addEventListener("click", () => { startMicrophone(); });
 stopButton.addEventListener("click", stopMicrophone);
+if (resetSystemButton) {
+  resetSystemButton.addEventListener("click", resetSystem);
+}
 playChunkButton.addEventListener("click", playLastChunk);
 if (stopPlaybackButton) {
   stopPlaybackButton.addEventListener("click", stopPlayback);
@@ -1697,6 +1770,7 @@ window.addEventListener("resize", syncPlaybackSpectrumSize);
 
 appendEvent("Voice interface is ready.");
 logAudioCapabilities();
+syncControlButtons();
 refreshDeviceLists();
 startSystemLogPolling();
 if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
