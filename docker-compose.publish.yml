@@ -1,0 +1,8 @@
+services:
+  stt:
+    ports:
+      - ${STT_PUBLISH_PORT}:8001
+
+  tts-router:
+    ports:
+      - ${TTS_PUBLISH_PORT}:8002

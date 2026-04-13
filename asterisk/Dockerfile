@@ -1,0 +1,11 @@
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends asterisk asterisk-doc curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY etc/ /etc/asterisk/
+
+CMD ["asterisk", "-f", "-U", "asterisk", "-G", "asterisk"]

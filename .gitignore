@@ -1,0 +1,52 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor and IDE settings
+.vscode/
+.idea/
+
+# Python environments
+.venv/
+venv/
+env/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/
+
+# Logs and runtime files
+*.log
+logs/
+*.pid
+
+# Temporary files and directories
+tmp/
+temp/
+.cache/
+
+# Local environment/config files
+.env
+.env.*
+!.env.example
+
+# Runtime persistent data
+data/
+logs/
+addons/custom/*
+!addons/custom/.gitkeep
+
+#dont publish certificates
+certs/live/127.0.0.1/

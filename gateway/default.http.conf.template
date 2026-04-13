@@ -1,0 +1,68 @@
+server {
+    listen 8080;
+    server_name ${DOMAIN};
+    client_max_body_size ${NGINX_CLIENT_MAX_BODY_SIZE};
+    resolver 127.0.0.11 valid=10s ipv6=off;
+
+    set $stt_upstream http://stt:8001;
+    set $tts_upstream http://tts-router:8002;
+    set $tools_upstream http://tools:8003;
+    set $webui_upstream http://webui-backend:8000;
+
+    location = /healthz {
+        access_log off;
+        return 200 'ok';
+        add_header Content-Type text/plain;
+    }
+
+    location /api/stt/ {
+        proxy_pass $stt_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/tts/ {
+        proxy_pass $tts_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/tools/ {
+        proxy_pass $tools_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /api/ {
+        proxy_pass $webui_upstream;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    location /ws {
+        proxy_pass $webui_upstream/ws;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection upgrade;
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+    }
+
+    location /ws/system-status {
+        proxy_pass $webui_upstream/ws/system-status;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection upgrade;
+        proxy_set_header Host $host;
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        root /usr/share/nginx/html;
+        try_files $uri /index.html;
+    }
+}

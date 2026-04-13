@@ -1,0 +1,60 @@
+services:
+  webui-backend:
+    command:
+      - uvicorn
+      - webui.backend.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload
+    volumes:
+      - .:/app
+      - ${DATA_ROOT}:/srv/data
+      - ${CONFIG_ROOT}:/srv/config
+      - ${LOG_ROOT}:/srv/logs
+
+  stt:
+    command:
+      - uvicorn
+      - services.stt.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8001"
+      - --reload
+    volumes:
+      - .:/app
+      - ${DATA_ROOT}:/srv/data
+      - ${CONFIG_ROOT}:/srv/config
+      - ${LOG_ROOT}:/srv/logs
+
+  tools:
+    command:
+      - uvicorn
+      - services.tools.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8003"
+      - --reload
+    volumes:
+      - .:/app
+      - ${DATA_ROOT}:/srv/data
+      - ${CONFIG_ROOT}:/srv/config
+      - ${LOG_ROOT}:/srv/logs
+
+  tts-router:
+    command:
+      - uvicorn
+      - services.tts_router.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8002"
+      - --reload
+    volumes:
+      - .:/app
+      - ${DATA_ROOT}:/srv/data
+      - ${CONFIG_ROOT}:/srv/config
+      - ${LOG_ROOT}:/srv/logs

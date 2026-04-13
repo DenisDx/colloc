@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Colloc Voice Chat</title>
+    <style>
+      :root {
+        --bg: #0b1420;
+        --panel: #122133;
+        --line: #2b4a6b;
+        --text: #e8f2ff;
+        --muted: #9ab8d9;
+        --accent: #ff6f3c;
+        --accent-2: #41c2b1;
+        --bad: #ff8a8a;
+        --ok: #66e0a3;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        font-family: "Trebuchet MS", sans-serif;
+        background:
+          radial-gradient(circle at 20% 0%, rgba(255, 111, 60, 0.2), transparent 30%),
+          radial-gradient(circle at 90% 20%, rgba(65, 194, 177, 0.18), transparent 35%),
+          linear-gradient(180deg, #09121d 0%, var(--bg) 100%);
+        color: var(--text);
+      }
+
+      main {
+        max-width: 1120px;
+        margin: 0 auto;
+        padding: 28px 18px 40px;
+      }
+
+      .top {
+        display: grid;
+        gap: 12px;
+        margin-bottom: 18px;
+      }
+
+      .badge {
+        width: fit-content;
+        padding: 6px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(18, 33, 51, 0.8);
+        color: var(--muted);
+        font-size: 13px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: clamp(30px, 6vw, 60px);
+        line-height: 0.92;
+      }
+
+      .layout {
+        display: grid;
+        gap: 14px;
+        grid-template-columns: 1.35fr 1fr;
+      }
+
+      .card {
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        background: var(--panel);
+        padding: 16px;
+        box-shadow: 0 16px 34px rgba(0, 0, 0, 0.28);
+      }
+
+      .controls {
+        display: grid;
+        gap: 10px;
+      }
+
+      .buttons {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        border: 0;
+        border-radius: 12px;
+        padding: 11px 14px;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .primary {
+        background: var(--accent);
+        color: #101010;
+      }
+
+      .secondary {
+        background: var(--accent-2);
+        color: #0d1b1e;
+      }
+
+      .danger {
+        background: var(--bad);
+        color: #261012;
+      }
+
+      .meter {
+        margin-top: 10px;
+        height: 12px;
+        width: 100%;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        overflow: hidden;
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .meter > span {
+        display: block;
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(90deg, var(--accent-2), var(--accent));
+        transition: width 120ms linear;
+      }
+
+      .chat {
+        min-height: 360px;
+        white-space: pre-wrap;
+        font-family: "Courier New", monospace;
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .ok {
+        color: var(--ok);
+      }
+
+      .bad {
+        color: var(--bad);
+      }
+
+      .links {
+        display: flex;
+        gap: 12px;
+        flex-wrap: wrap;
+      }
+
+      a {
+        color: #8ac8ff;
+      }
+
+      @media (max-width: 900px) {
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <section class="top">
+        <div class="badge">Voice interface</div>
+        <h1>Talk to the system</h1>
+        <p class="muted">This is the new main page for voice interaction. Microphone capture is local and messages are forwarded to backend websocket.</p>
+        <div class="links">
+          <a href="/status.html">System status</a>
+          <a href="/system-test.html">System test page</a>
+        </div>
+      </section>
+
+      <section class="layout">
+        <article class="card">
+          <h2>Voice session</h2>
+          <div class="controls">
+            <div id="voice-state" class="muted">State: disconnected</div>
+            <div class="buttons">
+              <button id="connect-btn" class="secondary" type="button">Connect session</button>
+              <button id="start-btn" class="primary" type="button">Start microphone</button>
+              <button id="stop-btn" class="danger" type="button">Stop microphone</button>
+            </div>
+            <div class="meter"><span id="vu-meter"></span></div>
+            <div id="mic-state" class="muted">Microphone: idle</div>
+          </div>
+        </article>
+        <article class="card">
+          <h2>Conversation stream</h2>
+          <pre id="chat-log" class="chat">No events yet.</pre>
+        </article>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
