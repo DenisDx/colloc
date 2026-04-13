@@ -15,6 +15,7 @@
         --accent-2: #41c2b1;
         --bad: #ff8a8a;
         --ok: #66e0a3;
+        --voice-col-width: 25%;
       }
 
       * {
@@ -32,9 +33,13 @@
       }
 
       main {
-        max-width: 1120px;
+        max-width: 1980px;
+        width: 100%;
         margin: 0 auto;
         padding: 28px 18px 40px;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
       }
 
       .top {
@@ -64,7 +69,23 @@
       .layout {
         display: grid;
         gap: 14px;
-        grid-template-columns: 1.35fr 1fr;
+        grid-template-columns: minmax(320px, var(--voice-col-width)) 10px minmax(0, 1fr);
+        align-items: start;
+        flex: 1;
+        min-height: 0;
+      }
+
+      .layout-splitter {
+        width: 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: linear-gradient(180deg, rgba(65, 194, 177, 0.25), rgba(42, 188, 215, 0.25));
+        cursor: col-resize;
+        align-self: stretch;
+      }
+
+      .layout-splitter:hover {
+        background: linear-gradient(180deg, rgba(65, 194, 177, 0.45), rgba(42, 188, 215, 0.45));
       }
 
       .card {
@@ -73,11 +94,60 @@
         background: var(--panel);
         padding: 16px;
         box-shadow: 0 16px 34px rgba(0, 0, 0, 0.28);
+        min-width: 0;
+      }
+
+      .voice-card {
+        resize: vertical;
+        overflow: auto;
+        min-height: 340px;
+        max-height: 88vh;
+      }
+
+      .conversation-card {
+        display: flex;
+        flex-direction: column;
+        height: clamp(340px, 62vh, 78vh);
+        min-height: 0;
+        overflow: hidden;
+        resize: vertical;
+        min-height: 260px;
+        max-height: 88vh;
+      }
+
+      .chat-scroll {
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: rgba(7, 16, 27, 0.75);
       }
 
       .controls {
         display: grid;
         gap: 10px;
+      }
+
+      .device-row {
+        display: grid;
+        gap: 8px;
+      }
+
+      .device-row label {
+        display: grid;
+        gap: 5px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .device-row select {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 8px 10px;
+        background: rgba(11, 20, 32, 0.9);
+        color: var(--text);
+        font-size: 13px;
       }
 
       .buttons {
@@ -127,12 +197,301 @@
         transition: width 120ms linear;
       }
 
+      .meter.vad > span {
+        background: linear-gradient(90deg, #52f0a9, #f0db52);
+      }
+
+      .meter.threshold > span {
+        background: linear-gradient(90deg, #7cbcff, #78f0ff);
+      }
+
+      .meter-row {
+        display: grid;
+        gap: 8px;
+      }
+
+      .meter-label {
+        display: flex;
+        justify-content: space-between;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .vad-state {
+        padding: 4px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        width: fit-content;
+        font-size: 13px;
+      }
+
+      .vad-state.active {
+        border-color: rgba(102, 224, 163, 0.5);
+        color: var(--ok);
+      }
+
+      .vad-state.idle {
+        border-color: rgba(154, 184, 217, 0.4);
+        color: var(--muted);
+      }
+
+      .playback-state {
+        padding: 4px 10px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        width: fit-content;
+        font-size: 13px;
+      }
+
+      .playback-state.playing {
+        border-color: rgba(102, 224, 163, 0.5);
+        color: var(--ok);
+      }
+
+      .playback-state.idle {
+        border-color: rgba(154, 184, 217, 0.4);
+        color: var(--muted);
+      }
+
+      .playback-state.error {
+        border-color: rgba(255, 138, 138, 0.45);
+        color: var(--bad);
+      }
+
+      .vad-tuning {
+        display: grid;
+        gap: 10px;
+        margin-top: 4px;
+        padding: 10px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: rgba(255, 255, 255, 0.03);
+      }
+
+      .vad-tuning label {
+        display: grid;
+        gap: 5px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .vad-tuning input[type="range"] {
+        width: 100%;
+      }
+
+      .vad-preset-row {
+        display: flex;
+        gap: 8px;
+        flex-wrap: wrap;
+        align-items: center;
+      }
+
+      .vad-preset-row select,
+      .vad-preset-row button {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 8px 10px;
+        background: rgba(11, 20, 32, 0.85);
+        color: var(--text);
+      }
+
+      .vad-preset-row button {
+        background: var(--accent-2);
+        color: #0d1b1e;
+        font-weight: 600;
+        cursor: pointer;
+      }
+
+      .vad-calibration-state {
+        font-size: 12px;
+        color: var(--muted);
+      }
+
+      .spec-wrap {
+        display: grid;
+        gap: 8px;
+      }
+
+      .spec-label {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      #spectrogram {
+        width: 100%;
+        height: 180px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(7, 16, 27, 0.9);
+        image-rendering: pixelated;
+      }
+
+      #chunk-waveform {
+        width: 100%;
+        height: 80px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(7, 16, 27, 0.9);
+      }
+
+      #playback-spectrum {
+        width: 100%;
+        height: 70px;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        background: rgba(7, 16, 27, 0.9);
+      }
+
+      .query-panel {
+        margin-top: 14px;
+        display: grid;
+        gap: 10px;
+      }
+
+      .query-row {
+        display: flex;
+        gap: 8px;
+      }
+
+      .query-row input[type="text"],
+      .query-panel textarea {
+        flex: 1;
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 9px 12px;
+        background: rgba(11, 20, 32, 0.9);
+        color: var(--text);
+        font-size: 14px;
+        font-family: inherit;
+        resize: vertical;
+      }
+
+      .query-panel textarea {
+        min-height: 60px;
+        max-height: 180px;
+      }
+
+      .query-row input[type="text"]:focus,
+      .query-panel textarea:focus {
+        outline: 1px solid var(--accent-2);
+      }
+
+      .query-panel select {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 9px 10px;
+        background: rgba(11, 20, 32, 0.9);
+        color: var(--text);
+        font-size: 13px;
+      }
+
+      .query-fieldset {
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        padding: 10px 12px;
+        display: grid;
+        gap: 8px;
+      }
+
+      .query-fieldset legend {
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.05em;
+        text-transform: uppercase;
+        padding: 0 6px;
+        cursor: pointer;
+      }
+
+      .prompt-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        flex-wrap: wrap;
+      }
+
+      .prompt-row label {
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .typing-indicator {
+        font-family: "Courier New", monospace;
+        font-size: 13px;
+        color: var(--accent-2);
+        min-height: 1.4em;
+      }
+
+      .chat-header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+
+      .chat-header h2 {
+        margin: 0;
+      }
+
+      .autoscroll-label {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        font-size: 13px;
+        color: var(--muted);
+        cursor: pointer;
+        user-select: none;
+      }
+
+      .autoscroll-label input[type="checkbox"] {
+        accent-color: var(--accent-2);
+        width: 15px;
+        height: 15px;
+        cursor: pointer;
+      }
+
       .chat {
-        min-height: 360px;
-        white-space: pre-wrap;
+        min-height: 100%;
+        overflow: visible;
+        white-space: pre;
         font-family: "Courier New", monospace;
         font-size: 13px;
         line-height: 1.45;
+        resize: none;
+        margin: 0;
+        padding: 12px;
+      }
+
+      .system-log-card {
+        margin-top: 14px;
+        display: flex;
+        flex-direction: column;
+        height: clamp(220px, 28vh, 320px);
+        min-height: 0;
+        overflow: hidden;
+        resize: vertical;
+        min-height: 180px;
+        max-height: 70vh;
+      }
+
+      .system-log-scroll {
+        flex: 1;
+        min-height: 0;
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: rgba(7, 16, 27, 0.75);
+      }
+
+      .system-log {
+        min-height: 100%;
+        overflow: visible;
+        white-space: pre;
+        font-family: "Courier New", monospace;
+        font-size: 12px;
+        line-height: 1.4;
+        margin: 0;
+        padding: 12px;
+        color: #c6d9ee;
       }
 
       .muted {
@@ -157,9 +516,28 @@
         color: #8ac8ff;
       }
 
-      @media (max-width: 900px) {
+      @media (max-width: 1979px) {
+        main {
+          max-width: none;
+          width: 100%;
+        }
+
         .layout {
           grid-template-columns: 1fr;
+          flex: 0;
+        }
+
+        .layout-splitter {
+          display: none;
+        }
+
+        .voice-card {
+          resize: none;
+          max-height: none;
+        }
+
+        .conversation-card {
+          height: 52vh;
         }
       }
     </style>
@@ -177,7 +555,7 @@
       </section>
 
       <section class="layout">
-        <article class="card">
+        <article class="card voice-card">
           <h2>Voice session</h2>
           <div class="controls">
             <div id="voice-state" class="muted">State: disconnected</div>
@@ -185,15 +563,131 @@
               <button id="connect-btn" class="secondary" type="button">Connect session</button>
               <button id="start-btn" class="primary" type="button">Start microphone</button>
               <button id="stop-btn" class="danger" type="button">Stop microphone</button>
+              <button id="play-chunk-btn" type="button" disabled>▶ Play last sent fragment</button>
+              <button id="stop-playback-btn" class="danger" type="button" disabled>■ Stop playback</button>
+              <button id="refresh-devices-btn" type="button">Refresh devices</button>
             </div>
-            <div class="meter"><span id="vu-meter"></span></div>
+            <div id="playback-state" class="playback-state idle">Playback: idle</div>
+            <div class="meter-row">
+              <div class="meter-label"><span>Microphone level</span><span id="mic-level-value">0%</span></div>
+              <div class="meter"><span id="vu-meter"></span></div>
+            </div>
+            <div class="meter-row">
+              <div class="meter-label"><span>VAD level</span><span id="vad-level-value">0%</span></div>
+              <div class="meter vad"><span id="vad-meter"></span></div>
+            </div>
+            <div class="meter-row">
+              <div class="meter-label"><span>Adaptive threshold</span><span id="vad-threshold-value">0%</span></div>
+              <div class="meter threshold"><span id="vad-threshold-meter"></span></div>
+            </div>
+            <div id="vad-state" class="vad-state idle">VAD: waiting</div>
             <div id="mic-state" class="muted">Microphone: idle</div>
+            <div class="spec-wrap">
+              <div class="spec-label">Microphone spectrum over recent seconds</div>
+              <canvas id="spectrogram" width="600" height="180"></canvas>
+              <div class="spec-label" style="margin-top:8px">Last sent fragment waveform (<span id="chunk-duration-value">n/a</span>)</div>
+              <canvas id="chunk-waveform" width="600" height="80"></canvas>
+              <div class="spec-label" style="margin-top:8px">Playback spectrum (current levels)</div>
+              <canvas id="playback-spectrum" width="600" height="70"></canvas>
+            </div>
+            <div class="vad-tuning">
+              <div class="vad-preset-row">
+                <label for="vad-preset" class="muted">Preset</label>
+                <select id="vad-preset">
+                  <option value="near">Speech near mic</option>
+                  <option value="noisy">Noisy room</option>
+                  <option value="far">Far mic</option>
+                  <option value="custom">Custom</option>
+                </select>
+                <button id="vad-calibrate" type="button">Auto-calibrate silence</button>
+                <span id="vad-calibration-state" class="vad-calibration-state">Calibration: idle</span>
+              </div>
+              <label for="vad-relaxation">
+                Relaxation speed (<span id="vad-relaxation-value">0.08</span>)
+                <input id="vad-relaxation" type="range" min="0" max="1000" step="1" value="659">
+              </label>
+              <label for="vad-activation">
+                Activation speed (<span id="vad-activation-value">0.20</span>)
+                <input id="vad-activation" type="range" min="0" max="1000" step="1" value="836">
+              </label>
+              <label for="vad-close-pause">
+                Close pause (<span id="vad-close-pause-value">0.60 s</span>)
+                <input id="vad-close-pause" type="range" min="200" max="2000" step="50" value="600">
+              </label>
+            </div>
+            <div class="device-row">
+              <label for="input-device-select">
+                Microphone device
+                <select id="input-device-select">
+                  <option value="">Default microphone</option>
+                </select>
+              </label>
+              <label for="output-device-select">
+                Playback device
+                <select id="output-device-select">
+                  <option value="">Default output</option>
+                </select>
+              </label>
+            </div>
           </div>
         </article>
-        <article class="card">
-          <h2>Conversation stream</h2>
-          <pre id="chat-log" class="chat">No events yet.</pre>
+        <div id="layout-splitter" class="layout-splitter" role="separator" aria-orientation="vertical" aria-label="Resize voice panel"></div>
+        <article class="card conversation-card">
+          <div class="chat-header">
+            <h2>Conversation stream</h2>
+            <label class="autoscroll-label">
+              <input id="autoscroll-toggle" type="checkbox" checked>
+              Auto-scroll
+            </label>
+          </div>
+          <div id="chat-scroll" class="chat-scroll">
+            <pre id="chat-log" class="chat">No events yet.</pre>
+          </div>
         </article>
+      </section>
+
+      <section class="query-panel">
+        <fieldset class="query-fieldset">
+          <legend>Session context</legend>
+          <div class="prompt-row">
+            <label for="role-select">Role</label>
+            <select id="role-select">
+              <option value="assistant">Assistant</option>
+              <option value="teacher">Teacher</option>
+              <option value="translator">Translator</option>
+              <option value="interviewer">Interviewer</option>
+              <option value="custom">Custom</option>
+            </select>
+            <label for="temperature-input">Temperature</label>
+            <input id="temperature-input" type="range" min="0" max="2" step="0.05" value="0.70">
+            <span id="temperature-value" class="muted">0.70</span>
+            <label class="autoscroll-label" for="reasoning-toggle">
+              <input id="reasoning-toggle" type="checkbox">
+              Reasoning
+            </label>
+          </div>
+          <textarea id="system-prompt" placeholder="System prompt (optional, overrides role if set)" rows="2"></textarea>
+          <button id="apply-config-btn" class="secondary" type="button" style="width:fit-content">Apply config</button>
+        </fieldset>
+
+        <div class="typing-indicator" id="typing-indicator"></div>
+        <div class="query-row">
+          <input id="text-input" type="text" placeholder="Type a message and press Enter or Send…">
+          <button id="send-text-btn" class="primary" type="button">Send</button>
+        </div>
+      </section>
+
+      <section class="card system-log-card">
+        <div class="chat-header">
+          <h2>System log</h2>
+          <label class="autoscroll-label" for="system-log-poll-interval">
+            Poll <span id="system-log-poll-interval-value">1.0 s</span>
+            <input id="system-log-poll-interval" type="range" min="100" max="10000" step="100" value="1000">
+          </label>
+        </div>
+        <div id="system-log-scroll" class="system-log-scroll">
+          <pre id="system-log" class="system-log">No system log yet.</pre>
+        </div>
       </section>
     </main>
 

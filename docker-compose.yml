@@ -220,16 +220,25 @@ services:
     profiles:
       - core
       - tts
+    environment:
+      PYTHONPATH: /app
+      PIPER_MODEL_DIR: /tmp/piper-models
+      PIPER_VOICE: ${PIPER_VOICE_EN}
+      PIPER_DEVICE: ${PIPER_DEVICE}
+      PIPER_VOICE_BASE_URL: ${PIPER_VOICE_BASE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0}
     command:
-      - sh
-      - -lc
-      - python -m http.server "$${PIPER_PORT_EN}" --bind 0.0.0.0
+      - uvicorn
+      - services.piper.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${PIPER_PORT_EN}"
     expose:
       - ${PIPER_PORT_EN}
     healthcheck:
       test:
         - CMD-SHELL
-        - curl -fsS http://127.0.0.1:$${PIPER_PORT_EN}/ >/dev/null || exit 1
+        - curl -fsS http://127.0.0.1:$${PIPER_PORT_EN}/health >/dev/null || exit 1
       interval: 30s
       timeout: 5s
       retries: 3
@@ -241,16 +250,25 @@ services:
     profiles:
       - core
       - tts
+    environment:
+      PYTHONPATH: /app
+      PIPER_MODEL_DIR: /tmp/piper-models
+      PIPER_VOICE: ${PIPER_VOICE_RU}
+      PIPER_DEVICE: ${PIPER_DEVICE}
+      PIPER_VOICE_BASE_URL: ${PIPER_VOICE_BASE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0}
     command:
-      - sh
-      - -lc
-      - python -m http.server "$${PIPER_PORT_RU}" --bind 0.0.0.0
+      - uvicorn
+      - services.piper.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${PIPER_PORT_RU}"
     expose:
       - ${PIPER_PORT_RU}
     healthcheck:
       test:
         - CMD-SHELL
-        - curl -fsS http://127.0.0.1:$${PIPER_PORT_RU}/ >/dev/null || exit 1
+        - curl -fsS http://127.0.0.1:$${PIPER_PORT_RU}/health >/dev/null || exit 1
       interval: 30s
       timeout: 5s
       retries: 3
@@ -262,16 +280,25 @@ services:
     profiles:
       - core
       - tts
+    environment:
+      PYTHONPATH: /app
+      KOKORO_MODEL_DIR: /tmp/kokoro-models
+      KOKORO_VOICE: ${KOKORO_VOICE}
+      KOKORO_MODEL_URL: ${KOKORO_MODEL_URL:-https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx}
+      KOKORO_VOICES_URL: ${KOKORO_VOICES_URL:-https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin}
     command:
-      - sh
-      - -lc
-      - python -m http.server "$${KOKORO_PORT}" --bind 0.0.0.0
+      - uvicorn
+      - services.kokoro.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${KOKORO_PORT}"
     expose:
       - ${KOKORO_PORT}
     healthcheck:
       test:
         - CMD-SHELL
-        - curl -fsS http://127.0.0.1:$${KOKORO_PORT}/ >/dev/null || exit 1
+        - curl -fsS http://127.0.0.1:$${KOKORO_PORT}/health >/dev/null || exit 1
       interval: 30s
       timeout: 5s
       retries: 3
