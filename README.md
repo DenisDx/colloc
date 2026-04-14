@@ -57,6 +57,57 @@ Compose profiles:
 
 ## Installation and Startup
 
+### Fresh Install (From Scratch)
+
+Use this section for a clean setup on a new host or new clone.
+
+1. Clone repository and enter directory:
+
+```bash
+git clone <your-repo-url> colloc
+cd colloc
+```
+
+2. Create local environment file:
+
+```bash
+cp .env.example .env
+```
+
+3. Edit `.env` with your values (LLM endpoint/model, TLS settings, optional SIP/Telegram).
+
+4. Prepare all project-local runtime directories and permissions:
+
+```bash
+chmod +x install.sh
+./install.sh
+```
+
+This step creates required folders in the workspace and ensures writable runtime paths for model preload under `./data`.
+
+5. Build and start full stack (core + TTS + SIP):
+
+```bash
+docker compose --profile core --profile tts --profile sip up -d --build
+```
+
+6. Verify health:
+
+```bash
+docker compose --profile core --profile tts --profile sip ps
+curl -fsS http://127.0.0.1:6080/healthz
+curl -fsS http://127.0.0.1:6080/api/health
+```
+
+7. If `AUTOLOAD=true`, verify preload:
+
+```bash
+curl -s -X POST http://127.0.0.1:6080/api/autoload-preload
+tail -n 80 logs/system.log | sed -n '/autoload\./p'
+```
+
+If you see permission-related preload errors in `logs/system.log`, run `./install.sh` again and restart affected services.
+
 ### 1. Prerequisites
 
 - Docker Engine 24+
@@ -229,7 +280,7 @@ docker compose logs -f tools
 docker compose logs -f redis
 
 # Optional profiles
-docker compose --profile sip logs -f asterisk
+docker compose --profile core --profile sip logs -f asterisk
 docker compose --profile telegram logs -f telegram-bot
 ```
 
@@ -334,9 +385,12 @@ docker compose exec silero sh -lc 'curl -fsS -X POST "http://127.0.0.1:${SILERO_
 ### Asterisk
 
 ```bash
-docker compose --profile sip ps asterisk
-docker compose --profile sip exec asterisk asterisk -rx 'core show uptime'
-docker compose --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
+docker compose --profile core --profile sip ps asterisk
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'core show uptime'
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
+
+# Realtime Asterisk logs (tail + follow)
+docker compose --profile core --profile sip logs -f --tail=200 asterisk
 ```
 
 ## Per-Service Test Requests
@@ -422,14 +476,21 @@ docker compose exec silero sh -lc 'curl -fsS "http://127.0.0.1:${SILERO_PORT:-60
 docker compose exec silero sh -lc 'curl -fsS -X POST "http://127.0.0.1:${SILERO_PORT:-6040}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"проверка синтеза\",\"language\":\"ru\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
 ```
 
-### 11. asterisk
+### 11. sip-service
 
 ```bash
-docker compose --profile sip exec asterisk asterisk -rx 'core show uptime'
-docker compose --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
+docker compose --profile core --profile sip exec sip-service curl -fsS http://127.0.0.1:8004/health
+docker compose --profile core --profile sip logs sip-service
 ```
 
-### 12. telegram-bot
+### 12. asterisk
+
+```bash
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'core show uptime'
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
+```
+
+### 13. telegram-bot
 
 ```bash
 docker compose --profile telegram ps telegram-bot
@@ -627,6 +688,194 @@ curl -s "${LLM_PROVIDER_PRIMARY_BASE_URL}/v1/chat/completions" \
 | `llm.done` | server→client | Full LLM response, session history updated |
 | `llm.warn` | server→client | Non-fatal warning (e.g. primary LLM failed, trying fallback) |
 | `error` | server→client | Error message |
+
+## SIP/Asterisk Voice Calls
+
+### Configuration
+
+To enable SIP voice calls via Asterisk, set up environment and profile:
+
+```bash
+# In .env:
+SIP_ENABLED=true
+SIP_SERVICE_PORT=8004
+SIP_ROLE=ai_scripts/test.md              # Path to role/system prompt
+SIP_GREETINGS=ai_scripts/greetings.md    # Greeting text or WAV file
+SIP_MAX_SILENCE=30                        # Silence timeout (seconds)
+SIP_MAX_DURATION=600                      # Call duration limit (seconds)
+ASTERISK_PJSIP_PORT=6060                  # SIP listen port
+ASTERISK_RTP_START=6700
+ASTERISK_RTP_END=6800
+```
+
+### Starting with SIP
+
+```bash
+# Start core services + SIP
+docker compose --profile core --profile tts --profile sip up -d
+```
+
+### Role and Greeting Files
+
+Create role and greeting files in `ai_scripts/` directory:
+
+**Role file (e.g., `ai_scripts/test.md`)**: System prompt / instructions for the AI during SIP calls.
+
+```markdown
+# SIP Test Role
+
+You are a helpful AI assistant on a phone call. Your role is to:
+- Be concise and natural in your responses
+- Respond in Russian if the user speaks Russian
+- Answer questions and provide assistance
+
+Remember to keep responses short and clear for phone conversations.
+```
+
+**Greeting file (e.g., `ai_scripts/greetings.md`)**: Welcome message (plain text or WAV file).
+
+```
+Привет! Я виртуальный ассистент. Как я могу вам помочь?
+```
+
+If the greeting file has a `.wav` extension, it will be played as-is without TTS synthesis.
+
+### Architecture
+
+SIP call flow:
+
+1. **Incoming Call**: Caller connects via SIP to Asterisk (port 6060).
+2. **Stasis**: Asterisk routes the call through Stasis application `colloc-call-handler`.
+3. **ARI Events**: Asterisk notifies `sip-service` via WebSocket using ARI (Asterisk REST Interface).
+4. **Greeting**: SIP service retrieves greeting file and synthesizes (if text) via TTS.
+5. **Main Loop**:
+   - Receive audio from caller
+   - Send to STT for transcription
+   - Send transcript to LLM
+   - Send LLM response to TTS
+   - Play audio back to caller
+6. **Timeout/Cleanup**: Call ends on silence timeout (`SIP_MAX_SILENCE`) or duration limit (`SIP_MAX_DURATION`).
+
+### Smoke Test
+
+Check SIP service and Asterisk:
+
+```bash
+# SIP service health
+docker compose --profile core --profile sip exec sip-service curl -fsS http://127.0.0.1:8004/health
+
+# Asterisk uptime
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'core show uptime'
+
+# Show configured PJSIP endpoints
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
+```
+
+Why both profiles are required:
+
+- `sip-service` has dependency on `stt` from `core` profile.
+- If you run commands with only `--profile sip`, Docker Compose can fail with:
+  `service "sip-service" depends on undefined service "stt": invalid compose project`.
+
+### Restarting Asterisk
+
+Use one of these options:
+
+```bash
+# Soft restart (only Asterisk container)
+docker compose --profile core --profile sip restart asterisk
+
+# Recreate Asterisk and ARI listener (recommended after config changes)
+docker compose --profile core --profile sip up -d --force-recreate asterisk sip-ari
+
+# Full SIP stack restart
+docker compose --profile core --profile sip restart asterisk sip-service sip-ari
+```
+
+After restart, verify:
+
+```bash
+docker compose --profile core --profile sip ps asterisk sip-ari sip-service
+docker compose --profile core --profile sip exec -T asterisk asterisk -rx 'core show uptime'
+docker compose --profile core --profile sip exec -T asterisk asterisk -rx 'pjsip show endpoints'
+```
+
+### Known Limitations
+
+- **Audio Frame Routing**: Current implementation is a placeholder. Real audio streaming requires AudioSocket protocol or bridge mixing integration (TODO).
+- **Authentication**: Default PJSIP credentials (`username: colloc, password: change-me`) must be changed in production.
+- **Conversation Context**: Full multi-turn context in Redis is not yet implemented; each call session uses simple turn-based history.
+- **Barge-In**: Interruption handling for caller input is stubbed (TODO: implement Asterisk channel stop and return-to-listen).
+
+### Testing with SIP Client
+
+Use a SIP softphone (Linphone, Zoiper, MicroSIP) from another device in the same LAN.
+
+1. Ensure services are running:
+
+```bash
+docker compose --profile core --profile tts --profile sip up -d
+docker compose --profile core --profile sip ps asterisk sip-service sip-ari
+```
+
+2. Check Asterisk endpoint state:
+
+```bash
+docker compose --profile core --profile sip exec -T asterisk asterisk -rx 'pjsip show endpoints'
+```
+
+You should see `colloc-endpoint` with transport `0.0.0.0:6060`.
+
+3. Find host LAN IP (on machine where Docker stack runs):
+
+```bash
+hostname -I
+```
+
+Use your LAN address (for example `192.168.1.100`).
+
+4. Configure SIP account in softphone:
+
+- SIP server / domain: `<LAN_HOST_IP>`
+- SIP port: `6060` (or your `ASTERISK_PJSIP_PORT`)
+- Transport: `UDP`
+- Username/Auth ID: `colloc`
+- Password: `change-me` (from `asterisk/etc/pjsip.conf`)
+
+5. Make a test call from the client:
+
+- Dial any numeric extension, for example `100`.
+- Current dialplan (`colloc-inbound`) routes `_X.` to `Stasis(colloc-call-handler)`.
+
+6. Watch runtime logs during call:
+
+```bash
+docker compose --profile core --profile sip logs -f asterisk sip-ari sip-service
+```
+
+Expected call path:
+
+- `asterisk`: incoming SIP INVITE and channel enters Stasis app `colloc-call-handler`
+- `sip-ari`: creates bridge + External Media channel
+- `sip-service`: starts call session, plays greeting, processes STT -> LLM -> TTS
+
+Example Linphone CLI sequence:
+
+```bash
+linphonec
+register sip:colloc@192.168.1.100:6060 colloc change-me
+call 100
+```
+
+If registration/call fails:
+
+- verify client and server are in the same subnet,
+- verify host firewall allows UDP `6060` and RTP range `6700-6800`,
+- re-check credentials in `asterisk/etc/pjsip.conf` and restart Asterisk:
+
+```bash
+docker compose --profile core --profile sip up -d --force-recreate asterisk sip-ari
+```
 
 ## Current Scope and Limitations
 

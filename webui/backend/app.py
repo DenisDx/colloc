@@ -13,6 +13,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel
 
 
 app = FastAPI(title="colloc-webui-backend")
@@ -23,9 +24,18 @@ TTS_STREAM_SOFT_CHUNK_CHARS = max(32, int(os.getenv("TTS_STREAM_SOFT_CHUNK_CHARS
 TTS_STREAM_MIN_CHUNK_CHARS = max(16, int(os.getenv("TTS_STREAM_MIN_CHUNK_CHARS", "48")))
 
 # Background tasks for model preloading
-_AUTOLOAD_ENABLED = os.getenv("AUTOLOAD", "false").lower() in {"true", "1", "yes"}
+_AUTOLOAD_CONFIG_DEFAULT = os.getenv("AUTOLOAD", "false").lower() in {"true", "1", "yes"}
+_AUTOLOAD_ENABLED = _AUTOLOAD_CONFIG_DEFAULT
 _LLM_RELOAD_INTERVAL_SEC = int(os.getenv("AUTOLOAD_LLM_RELOAD_INTERVAL_SEC", "180"))
 _LLM_RELOAD_TASK: asyncio.Task[Any] | None = None
+_AUTOLOAD_PRELOAD_TASK: asyncio.Task[Any] | None = None
+_AUTOLOAD_STATE_LOCK = asyncio.Lock()
+
+
+class AutoloadToggleRequest(BaseModel):
+    """Runtime request to enable/disable keep-models-loaded behavior. Output: parsed body. Input: enabled boolean."""
+
+    enabled: bool
 
 
 async def _preload_stt() -> None:
@@ -127,6 +137,8 @@ async def _reload_llm_loop() -> None:
     while True:
         try:
             await asyncio.sleep(_LLM_RELOAD_INTERVAL_SEC)
+            if not _AUTOLOAD_ENABLED:
+                continue
             timeout = httpx.Timeout(120.0, connect=5.0)
             llm_url = os.getenv("LLM_PROVIDER_PRIMARY_BASE_URL", "http://ollama:11434").rstrip("/")
             # Try to trigger a minimal generate call to keep model loaded
@@ -147,6 +159,40 @@ async def _reload_llm_loop() -> None:
             append_system_log("autoload", "llm_reload_error", f"LLM reload failed: {exc}")
 
 
+async def _run_autoload_preload() -> None:
+    """Preload configured models for runtime keep-loaded mode. Output: none. Input: none."""
+    append_system_log("autoload", "startup", "Model preloading enabled")
+    await asyncio.gather(_preload_stt(), _preload_tts(), return_exceptions=True)
+
+
+async def _set_autoload_runtime_enabled(enabled: bool) -> None:
+    """Update runtime keep-models-loaded state. Output: none. Input: enable flag."""
+    global _AUTOLOAD_ENABLED, _LLM_RELOAD_TASK, _AUTOLOAD_PRELOAD_TASK
+
+    async with _AUTOLOAD_STATE_LOCK:
+        if _AUTOLOAD_ENABLED == enabled:
+            return
+
+        _AUTOLOAD_ENABLED = enabled
+
+        if enabled:
+            append_system_log("autoload", "runtime_enabled", "Keep-models-loaded mode enabled.")
+            _AUTOLOAD_PRELOAD_TASK = asyncio.create_task(_run_autoload_preload())
+            if _LLM_RELOAD_INTERVAL_SEC > 0 and (_LLM_RELOAD_TASK is None or _LLM_RELOAD_TASK.done()):
+                _LLM_RELOAD_TASK = asyncio.create_task(_reload_llm_loop())
+                append_system_log(
+                    "autoload", "llm_reload_start", f"LLM reload loop started (interval: {_LLM_RELOAD_INTERVAL_SEC}s)"
+                )
+            return
+
+        append_system_log("autoload", "runtime_disabled", "Keep-models-loaded mode disabled.")
+        if _AUTOLOAD_PRELOAD_TASK is not None and not _AUTOLOAD_PRELOAD_TASK.done():
+            _AUTOLOAD_PRELOAD_TASK.cancel()
+        if _LLM_RELOAD_TASK is not None and not _LLM_RELOAD_TASK.done():
+            _LLM_RELOAD_TASK.cancel()
+            _LLM_RELOAD_TASK = None
+
+
 @app.on_event("startup")
 async def startup_preload() -> None:
     """Preload models on startup if AUTOLOAD is enabled. Output: none. Input: none."""
@@ -154,10 +200,7 @@ async def startup_preload() -> None:
     if not _AUTOLOAD_ENABLED:
         return
 
-    append_system_log("autoload", "startup", "Model preloading enabled")
-
-    # Preload STT and TTS in parallel
-    await asyncio.gather(_preload_stt(), _preload_tts(), return_exceptions=True)
+    await _run_autoload_preload()
 
     # Start LLM reload loop
     if _LLM_RELOAD_INTERVAL_SEC > 0:
@@ -170,9 +213,11 @@ async def startup_preload() -> None:
 @app.on_event("shutdown")
 def shutdown_cleanup() -> None:
     """Cancel background tasks on shutdown. Output: none. Input: none."""
-    global _LLM_RELOAD_TASK
+    global _LLM_RELOAD_TASK, _AUTOLOAD_PRELOAD_TASK
     if _LLM_RELOAD_TASK is not None and not _LLM_RELOAD_TASK.done():
         _LLM_RELOAD_TASK.cancel()
+    if _AUTOLOAD_PRELOAD_TASK is not None and not _AUTOLOAD_PRELOAD_TASK.done():
+        _AUTOLOAD_PRELOAD_TASK.cancel()
 
 
 
@@ -184,10 +229,7 @@ def resolve_system_log_path() -> Path:
         candidates.append(Path(env_path))
     candidates.extend(
         [
-            Path("/app/log/system.log"),
             Path("/srv/logs/system.log"),
-            Path("log/system.log"),
-            Path("/tmp/system.log"),
         ]
     )
 
@@ -199,7 +241,7 @@ def resolve_system_log_path() -> Path:
         except OSError:
             continue
 
-    return Path("/tmp/system.log")
+    return candidates[0]
 
 
 SYSTEM_LOG_PATH = resolve_system_log_path()
@@ -425,16 +467,24 @@ def autoload_status() -> dict[str, Any]:
     global _LLM_RELOAD_TASK
     return {
         "enabled": _AUTOLOAD_ENABLED,
+        "configured_default": _AUTOLOAD_CONFIG_DEFAULT,
         "llm_reload_interval_sec": _LLM_RELOAD_INTERVAL_SEC,
         "llm_reload_task_running": _LLM_RELOAD_TASK is not None and not _LLM_RELOAD_TASK.done(),
     }
+
+
+@app.post("/api/autoload-status")
+async def autoload_set_status(request: AutoloadToggleRequest) -> dict[str, Any]:
+    """Set runtime keep-models-loaded state until process restart. Output: status dict. Input: enabled boolean."""
+    await _set_autoload_runtime_enabled(request.enabled)
+    return autoload_status()
 
 
 @app.post("/api/autoload-preload")
 async def autoload_preload_now() -> dict[str, Any]:
     """Manually trigger model preloading. Output: result dict. Input: none."""
     if not _AUTOLOAD_ENABLED:
-        return {"status": "disabled", "message": "AUTOLOAD is not enabled"}
+        return {"status": "disabled", "message": "Keep-models-loaded mode is disabled"}
 
     results = {
         "stt": {},

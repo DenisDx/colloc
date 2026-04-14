@@ -26,7 +26,7 @@ class SynthesisRequest(BaseModel):
 
 def _asset_dir() -> Path:
     """Resolve local Kokoro asset directory. Output: path. Input: none."""
-    return Path(os.getenv("KOKORO_MODEL_DIR", "/tmp/kokoro-models"))
+    return Path(os.getenv("KOKORO_MODEL_DIR", "/srv/data/kokoro-models"))
 
 
 def _asset_urls() -> tuple[str, str]:

@@ -44,6 +44,7 @@ const roleSelectNode = document.getElementById("role-select");
 const temperatureInput = document.getElementById("temperature-input");
 const temperatureValueNode = document.getElementById("temperature-value");
 const reasoningToggle = document.getElementById("reasoning-toggle");
+const autoloadToggle = document.getElementById("autoload-toggle");
 const applyConfigButton = document.getElementById("apply-config-btn");
 const textInputNode = document.getElementById("text-input");
 const sendTextButton = document.getElementById("send-text-btn");
@@ -108,6 +109,7 @@ let stopPlaybackRequested = false;
 let ttsPlaybackQueue = [];
 let ttsPlaybackInProgress = false;
 let isResizingLayout = false;
+let autoloadStatusRequestInFlight = false;
 
 const VAD_PRESETS = {
   near: { relaxation: 0.06, activation: 0.18, floorMin: 0.035 },
@@ -722,6 +724,53 @@ function renderTemperatureValue() {
     return;
   }
   temperatureValueNode.textContent = clamp(parseFloat(temperatureInput.value), 0, 2).toFixed(2);
+}
+
+// Fetch current runtime keep-models-loaded state. Output: none. Input: none.
+async function refreshAutoloadStatus() {
+  if (!autoloadToggle || autoloadStatusRequestInFlight) {
+    return;
+  }
+  autoloadStatusRequestInFlight = true;
+  try {
+    const response = await fetch("/api/autoload-status");
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    autoloadToggle.checked = !!payload.enabled;
+    autoloadToggle.dataset.configDefault = payload.configured_default ? "true" : "false";
+  } catch (err) {
+    appendEvent(`Keep-models-loaded status error: ${err.message || err}`);
+  } finally {
+    autoloadStatusRequestInFlight = false;
+  }
+}
+
+// Update runtime keep-models-loaded state until backend restart. Output: none. Input: none.
+async function setAutoloadEnabled(enabled) {
+  if (!autoloadToggle) {
+    return;
+  }
+  autoloadToggle.disabled = true;
+  try {
+    const response = await fetch("/api/autoload-status", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !!enabled }),
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    autoloadToggle.checked = !!payload.enabled;
+    appendEvent(`Keep models loaded ${payload.enabled ? "enabled" : "disabled"}.`);
+  } catch (err) {
+    autoloadToggle.checked = !enabled;
+    appendEvent(`Keep-models-loaded toggle error: ${err.message || err}`);
+  } finally {
+    autoloadToggle.disabled = false;
+  }
 }
 
 // Append LLM streaming token in-place on the last log line. Output: none. Input: token string.
@@ -1849,9 +1898,15 @@ if (systemLogPollIntervalInput) {
 if (temperatureInput) {
   temperatureInput.addEventListener("input", renderTemperatureValue);
 }
+if (autoloadToggle) {
+  autoloadToggle.addEventListener("change", () => {
+    setAutoloadEnabled(autoloadToggle.checked);
+  });
+}
 applyVadPreset("near");
 renderVadIndicators(0, 0, 0);
 setCalibrationState("idle");
 renderTemperatureValue();
 stopPlaybackSpectrum();
 setPlaybackState("idle", "idle");
+refreshAutoloadStatus();

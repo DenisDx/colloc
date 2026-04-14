@@ -1,7 +1,9 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl ffmpeg \
@@ -10,12 +12,13 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt /tmp/requirements.txt
+COPY requirements.txt /app/requirements.txt
 
-RUN pip install --no-cache-dir -r /tmp/requirements.txt
+RUN python -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
 USER app
 
-CMD ["python", "-c", "print('colloc base image is healthy')"]
+CMD ["/opt/venv/bin/python", "-c", "print('colloc base image is healthy')"]

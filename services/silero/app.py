@@ -39,7 +39,7 @@ class SynthesisRequest(BaseModel):
 
 def _model_dir() -> Path:
     """Resolve local model cache directory. Output: path. Input: none."""
-    return Path(os.getenv("SILERO_MODEL_DIR", "/tmp/silero-models"))
+    return Path(os.getenv("SILERO_MODEL_DIR", "/srv/data/silero-models"))
 
 
 def _default_language() -> str:

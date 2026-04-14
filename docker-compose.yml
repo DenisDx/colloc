@@ -8,6 +8,10 @@ x-app-service: &app-service
     - .env
   environment:
     PYTHONPATH: /app
+    VIRTUAL_ENV: /opt/venv
+    PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    SYSTEM_LOG_PATH: /srv/logs/system.log
+    TMPDIR: /srv/data/tmp
   restart: unless-stopped
   security_opt:
     - no-new-privileges:true
@@ -86,7 +90,7 @@ services:
       redis:
         condition: service_healthy
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - webui.backend.app:app
       - --host
       - 0.0.0.0
@@ -143,7 +147,7 @@ services:
     profiles:
       - core
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.tools.app:app
       - --host
       - 0.0.0.0
@@ -176,7 +180,7 @@ services:
               count: all
               capabilities: [gpu]
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.stt.app:app
       - --host
       - 0.0.0.0
@@ -213,7 +217,7 @@ services:
         condition: service_started
         required: false
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.tts_router.app:app
       - --host
       - 0.0.0.0
@@ -238,12 +242,16 @@ services:
       - tts-piper-en
     environment:
       PYTHONPATH: /app
-      PIPER_MODEL_DIR: /tmp/piper-models
+      VIRTUAL_ENV: /opt/venv
+      PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      SYSTEM_LOG_PATH: /srv/logs/system.log
+      TMPDIR: /srv/data/tmp
+      PIPER_MODEL_DIR: /srv/data/piper-models/en
       PIPER_VOICE: ${TTS_EN_PRIMARY_VOICE}
       PIPER_DEVICE: ${PIPER_DEVICE}
       PIPER_VOICE_BASE_URL: ${PIPER_VOICE_BASE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0}
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.piper.app:app
       - --host
       - 0.0.0.0
@@ -268,12 +276,16 @@ services:
       - tts-piper-ru
     environment:
       PYTHONPATH: /app
-      PIPER_MODEL_DIR: /tmp/piper-models
+      VIRTUAL_ENV: /opt/venv
+      PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      SYSTEM_LOG_PATH: /srv/logs/system.log
+      TMPDIR: /srv/data/tmp
+      PIPER_MODEL_DIR: /srv/data/piper-models/ru
       PIPER_VOICE: ${TTS_RU_PRIMARY_VOICE}
       PIPER_DEVICE: ${PIPER_DEVICE}
       PIPER_VOICE_BASE_URL: ${PIPER_VOICE_BASE_URL:-https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0}
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.piper.app:app
       - --host
       - 0.0.0.0
@@ -298,12 +310,16 @@ services:
       - tts-kokoro
     environment:
       PYTHONPATH: /app
-      KOKORO_MODEL_DIR: /tmp/kokoro-models
+      VIRTUAL_ENV: /opt/venv
+      PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      SYSTEM_LOG_PATH: /srv/logs/system.log
+      TMPDIR: /srv/data/tmp
+      KOKORO_MODEL_DIR: /srv/data/kokoro-models
       KOKORO_VOICE: ${KOKORO_VOICE:-en_US_Emily}
       KOKORO_MODEL_URL: ${KOKORO_MODEL_URL:-https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx}
       KOKORO_VOICES_URL: ${KOKORO_VOICES_URL:-https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin}
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.kokoro.app:app
       - --host
       - 0.0.0.0
@@ -328,9 +344,13 @@ services:
       - tts-silero
     environment:
       PYTHONPATH: /app
-      SILERO_MODEL_DIR: /tmp/silero-models
+      VIRTUAL_ENV: /opt/venv
+      PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      SYSTEM_LOG_PATH: /srv/logs/system.log
+      TMPDIR: /srv/data/tmp
+      SILERO_MODEL_DIR: /srv/data/silero-models
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.silero.app:app
       - --host
       - 0.0.0.0
@@ -347,18 +367,115 @@ services:
       retries: 3
       start_period: 5s
 
+  sip-service:
+    <<: *app-service
+    container_name: colloc-sip-service
+    profiles:
+      - sip
+    environment:
+      PYTHONPATH: /app
+      VIRTUAL_ENV: /opt/venv
+      PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      SYSTEM_LOG_PATH: /srv/logs/system.log
+      TMPDIR: /srv/data/tmp
+      HF_HOME: /srv/data/huggingface
+      XDG_CACHE_HOME: /srv/data/xdg-cache
+      STT_MODEL_CACHE_DIR: /srv/data/faster-whisper-models
+      SIP_SERVICE_PORT: ${SIP_SERVICE_PORT}
+      SIP_DEFAULT_LANGUAGE: ${SIP_DEFAULT_LANGUAGE}
+      SIP_ROLE: ${SIP_ROLE}
+      SIP_GREETINGS: ${SIP_GREETINGS}
+      SIP_MAX_SILENCE: ${SIP_MAX_SILENCE}
+      SIP_MAX_DURATION: ${SIP_MAX_DURATION}
+      SIP_VAD_THRESHOLD: ${SIP_VAD_THRESHOLD}
+      SIP_BARGE_IN_THRESHOLD: ${SIP_BARGE_IN_THRESHOLD}
+      SIP_UTTERANCE_MIN_MS: ${SIP_UTTERANCE_MIN_MS}
+      SIP_UTTERANCE_END_SILENCE_MS: ${SIP_UTTERANCE_END_SILENCE_MS}
+      ASTERISK_HTTP_URL: ${ASTERISK_HTTP_URL}
+      ASTERISK_ARI_USER: ${ASTERISK_ARI_USER}
+      ASTERISK_ARI_PASSWORD: ${ASTERISK_ARI_PASSWORD}
+      STT_URL: http://stt:8001
+      TTS_ROUTER_URL: http://tts-router:8002
+      LLM_PROVIDER_PRIMARY_BASE_URL: ${LLM_PROVIDER_PRIMARY_BASE_URL}
+      LLM_PROVIDER_PRIMARY_MODEL: ${LLM_PROVIDER_PRIMARY_MODEL}
+    depends_on:
+      redis:
+        condition: service_healthy
+      stt:
+        condition: service_started
+      tts-router:
+        condition: service_started
+    command:
+      - /opt/venv/bin/uvicorn
+      - services.sip.app:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "${SIP_SERVICE_PORT}"
+    expose:
+      - ${SIP_SERVICE_PORT}
+      - ${SIP_MEDIA_PORT_START}-${SIP_MEDIA_PORT_END}/udp
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl -fsS http://127.0.0.1:${SIP_SERVICE_PORT}/health >/dev/null || exit 1
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  sip-ari:
+    <<: *app-service
+    container_name: colloc-sip-ari
+    profiles:
+      - sip
+    depends_on:
+      sip-service:
+        condition: service_healthy
+      asterisk:
+        condition: service_started
+    environment:
+      PYTHONPATH: /app
+      VIRTUAL_ENV: /opt/venv
+      PATH: /opt/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      SYSTEM_LOG_PATH: /srv/logs/system.log
+      TMPDIR: /srv/data/tmp
+      ASTERISK_HTTP_URL: ${ASTERISK_HTTP_URL}
+      ASTERISK_ARI_APP: ${ASTERISK_ARI_APP}
+      ASTERISK_ARI_USER: ${ASTERISK_ARI_USER}
+      ASTERISK_ARI_PASSWORD: ${ASTERISK_ARI_PASSWORD}
+      ASTERISK_SIP_SERVICE_URL: ${ASTERISK_SIP_SERVICE_URL}
+      SIP_MEDIA_HOST: ${SIP_MEDIA_HOST}
+      SIP_MEDIA_PORT_START: ${SIP_MEDIA_PORT_START}
+      SIP_MEDIA_PORT_END: ${SIP_MEDIA_PORT_END}
+      SIP_DEFAULT_LANGUAGE: ${SIP_DEFAULT_LANGUAGE}
+    command:
+      - /opt/venv/bin/python
+      - services/sip/ari_listener.py
+
   asterisk:
-    image: andrius/asterisk:latest
+    build:
+      context: ./asterisk
+      dockerfile: Dockerfile
     container_name: colloc-asterisk
     restart: "no"
     profiles:
       - sip
+    depends_on:
+      sip-service:
+        condition: service_healthy
     networks:
       - colloc
     volumes:
       - ${DATA_ROOT}/asterisk:/var/lib/asterisk
       - ${LOG_ROOT}/asterisk:/var/log/asterisk
+      - ./asterisk/etc/ari.conf:/etc/asterisk/ari.conf:ro
+      - ./asterisk/etc/http.conf:/etc/asterisk/http.conf:ro
+      - ./asterisk/etc/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./asterisk/etc/pjsip.conf:/etc/asterisk/pjsip.conf:ro
       - ./asterisk/etc/stasis.conf:/etc/asterisk/stasis.conf:ro
+      - ./asterisk/etc/modules.conf:/etc/asterisk/modules.conf:ro
+      - ./asterisk/etc/rtp.conf:/etc/asterisk/rtp.conf:ro
     ports:
       - ${ASTERISK_PJSIP_PORT}:${ASTERISK_PJSIP_PORT}/udp
       - ${ASTERISK_RTP_START}-${ASTERISK_RTP_END}:${ASTERISK_RTP_START}-${ASTERISK_RTP_END}/udp

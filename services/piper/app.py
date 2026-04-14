@@ -24,7 +24,7 @@ class SynthesisRequest(BaseModel):
 
 def _model_dir() -> Path:
     """Resolve local model directory. Output: path. Input: none."""
-    return Path(os.getenv("PIPER_MODEL_DIR", "/tmp/piper-models"))
+    return Path(os.getenv("PIPER_MODEL_DIR", "/srv/data/piper-models"))
 
 
 def _voice_id() -> str:

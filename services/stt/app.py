@@ -27,6 +27,13 @@ _TIMING_HISTORY_LIMIT = max(10, int(os.getenv("STT_TIMING_HISTORY_LIMIT", "200")
 _TIMING_HISTORY: dict[str, list[float]] = defaultdict(list)
 
 
+def _ensure_runtime_dir(env_name: str, default_path: str) -> str:
+    """Create runtime directory under project storage. Output: absolute path string. Input: env key and default path."""
+    path = os.getenv(env_name, default_path)
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
 def _record_timing(stage: str, duration_ms: float) -> None:
     """Record one stage duration sample. Output: none. Input: stage and duration in ms."""
     values = _TIMING_HISTORY[stage]
@@ -94,10 +101,10 @@ def get_memory_usage_mb() -> float:
 def get_whisper_model() -> WhisperModel:
     """Get cached Whisper model instance. Output: WhisperModel. Input: none."""
     global _MODEL, _MODEL_KEY, _MODEL_RUNTIME_DEVICE
-    hf_home = os.getenv("HF_HOME", "/tmp/huggingface")
+    hf_home = _ensure_runtime_dir("HF_HOME", "/srv/data/huggingface")
     os.environ.setdefault("HF_HOME", hf_home)
     os.environ.setdefault("HUGGINGFACE_HUB_CACHE", f"{hf_home}/hub")
-    os.environ.setdefault("XDG_CACHE_HOME", "/tmp")
+    os.environ.setdefault("XDG_CACHE_HOME", _ensure_runtime_dir("XDG_CACHE_HOME", "/srv/data/xdg-cache"))
     os.makedirs(os.environ["HF_HOME"], exist_ok=True)
     os.makedirs(os.environ["HUGGINGFACE_HUB_CACHE"], exist_ok=True)
 
@@ -106,7 +113,7 @@ def get_whisper_model() -> WhisperModel:
     device = provider["device"] or "cpu"
     compute_type = provider["compute_type"] or ("float16" if device != "cpu" else "int8")
     model_key = (model_name, device, compute_type)
-    download_root = os.getenv("STT_MODEL_CACHE_DIR", "/tmp/faster-whisper-models")
+    download_root = _ensure_runtime_dir("STT_MODEL_CACHE_DIR", "/srv/data/faster-whisper-models")
 
     if _MODEL is not None and _MODEL_KEY == model_key:
         return _MODEL
@@ -208,10 +215,11 @@ async def transcribe_faster_whisper(request: TranscriptionRequest) -> dict[str, 
     beam_size = int(os.getenv("STT_BEAM_SIZE", "5"))
     vad_filter = os.getenv("STT_VAD_FILTER", "true").lower() == "true"
     ext = _mime_to_ext(request.mime_type)
+    tmp_dir = _ensure_runtime_dir("TMPDIR", "/srv/data/tmp")
 
     try:
         stage_started_at = time.perf_counter()
-        with tempfile.NamedTemporaryFile(suffix=ext, delete=True) as tmp:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=True, dir=tmp_dir) as tmp:
             tmp.write(audio_bytes)
             tmp.flush()
             segments, info = model.transcribe(

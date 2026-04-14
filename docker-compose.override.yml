@@ -1,7 +1,7 @@
 services:
   webui-backend:
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - webui.backend.app:app
       - --host
       - 0.0.0.0
@@ -16,7 +16,7 @@ services:
 
   stt:
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.stt.app:app
       - --host
       - 0.0.0.0
@@ -31,7 +31,7 @@ services:
 
   tools:
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.tools.app:app
       - --host
       - 0.0.0.0
@@ -46,7 +46,7 @@ services:
 
   tts-router:
     command:
-      - uvicorn
+      - /opt/venv/bin/uvicorn
       - services.tts_router.app:app
       - --host
       - 0.0.0.0

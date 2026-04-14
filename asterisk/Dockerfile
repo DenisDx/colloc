@@ -8,4 +8,4 @@ RUN apt-get update \
 
 COPY etc/ /etc/asterisk/
 
-CMD ["asterisk", "-f", "-U", "asterisk", "-G", "asterisk"]
+CMD ["asterisk", "-f"]

@@ -4,7 +4,9 @@ FROM nvidia/cuda:12.1.1-runtime-ubuntu22.04
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    VIRTUAL_ENV=/opt/venv \
+    PATH=/opt/venv/bin:$PATH
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -15,11 +17,12 @@ RUN apt-get update \
 
 WORKDIR /app
 
-COPY requirements.txt /tmp/requirements.txt
-RUN python3 -m pip install --no-cache-dir -r /tmp/requirements.txt
+COPY requirements.txt /app/requirements.txt
+RUN python3 -m venv /opt/venv \
+    && /opt/venv/bin/pip install --no-cache-dir -r /app/requirements.txt
 
 COPY . /app
 
 USER app
 
-CMD ["python3", "-c", "print('colloc-stt GPU image is healthy')"]
+CMD ["/opt/venv/bin/python", "-c", "print('colloc-stt GPU image is healthy')"]
