@@ -70,7 +70,7 @@
         display: grid;
         gap: 14px;
         grid-template-columns: minmax(320px, var(--voice-col-width)) 10px minmax(0, 1fr);
-        align-items: start;
+        align-items: stretch;
         flex: 1;
         min-height: 0;
       }
@@ -107,7 +107,7 @@
       .conversation-card {
         display: flex;
         flex-direction: column;
-        height: clamp(340px, 62vh, 78vh);
+        height: auto;
         min-height: 0;
         overflow: hidden;
         resize: vertical;

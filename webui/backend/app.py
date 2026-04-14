@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import resource
+import shlex
 import subprocess
 import time
 from collections import defaultdict
@@ -18,6 +19,8 @@ app = FastAPI(title="colloc-webui-backend")
 REQUESTS_TOTAL = 0
 REQUESTS_BY_PATH: dict[str, int] = defaultdict(int)
 WS_MESSAGES_TOTAL = 0
+TTS_STREAM_SOFT_CHUNK_CHARS = max(32, int(os.getenv("TTS_STREAM_SOFT_CHUNK_CHARS", "120")))
+TTS_STREAM_MIN_CHUNK_CHARS = max(16, int(os.getenv("TTS_STREAM_MIN_CHUNK_CHARS", "48")))
 
 # Background tasks for model preloading
 _AUTOLOAD_ENABLED = os.getenv("AUTOLOAD", "false").lower() in {"true", "1", "yes"}
@@ -38,13 +41,75 @@ async def _preload_stt() -> None:
         append_system_log("autoload", "stt_error", f"STT preload failed: {exc}")
 
 
+def _active_tts_preload_endpoints() -> list[tuple[str, str]]:
+    """Build preload endpoint list from per-language TTS config. Output: list of (url, name). Input: none."""
+    endpoints: list[tuple[str, str]] = []
+    seen_providers: set[str] = set()
+    piper_langs: dict[str, str] = {}  # lang -> port
+
+    for key, val in os.environ.items():
+        if not val or not key.startswith("TTS_"):
+            continue
+        parts = key.split("_")
+        # TTS_<LANG>_<PRIMARY|FALLBACK>_PROVIDER
+        if len(parts) == 4 and parts[2] in {"PRIMARY", "FALLBACK"} and parts[3] == "PROVIDER":
+            lang = parts[1]
+            provider = val.lower()
+            port_key = f"TTS_{lang}_{parts[2]}_PORT"
+
+            if provider == "piper" and lang not in piper_langs:
+                port = os.getenv(port_key, "")
+                if port:
+                    piper_langs[lang] = port
+
+            elif provider in {"kokoro", "silero"} and provider not in seen_providers:
+                seen_providers.add(provider)
+                if provider == "kokoro":
+                    port = os.getenv("KOKORO_PORT", "6030")
+                    endpoints.append((f"http://kokoro:{port}/preload", "kokoro"))
+                elif provider == "silero":
+                    port = os.getenv("SILERO_PORT", "6040")
+                    endpoints.append((f"http://silero:{port}/preload", "silero"))
+
+    for lang, port in piper_langs.items():
+        name = f"piper-{lang.lower()}"
+        endpoints.append((f"http://{name}:{port}/preload", name))
+
+    return endpoints
+
+
+def _active_tts_reset_profiles() -> list[str]:
+    """Build active TTS compose profiles from per-language provider config. Output: profile list. Input: none."""
+    profiles: set[str] = set()
+    for key, val in os.environ.items():
+        if not val or not key.startswith("TTS_"):
+            continue
+        parts = key.split("_")
+        if len(parts) != 4 or parts[2] not in {"PRIMARY", "FALLBACK"} or parts[3] != "PROVIDER":
+            continue
+
+        lang = parts[1].lower()
+        provider = val.lower().strip()
+        if provider == "piper":
+            profiles.add(f"tts-piper-{lang}")
+        elif provider == "kokoro":
+            profiles.add("tts-kokoro")
+        elif provider == "silero":
+            profiles.add("tts-silero")
+
+    return sorted(profiles)
+
+
+def _default_system_reset_command() -> str:
+    """Build default reset command with core and active TTS dependency profiles. Output: shell command. Input: none."""
+    profile_args = ["--profile core", *[f"--profile {profile}" for profile in _active_tts_reset_profiles()]]
+    compose_base = f"docker compose {' '.join(profile_args)}"
+    return f"{compose_base} down && {compose_base} up -d"
+
+
 async def _preload_tts() -> None:
-    """Preload TTS models (Piper EN/RU + Kokoro) via HTTP. Output: none. Input: none."""
-    endpoints = [
-        (f"http://piper-en:{os.getenv('PIPER_PORT_EN', '6010')}/preload", "piper-en"),
-        (f"http://piper-ru:{os.getenv('PIPER_PORT_RU', '6011')}/preload", "piper-ru"),
-        (f"http://kokoro:{os.getenv('KOKORO_PORT', '6030')}/preload", "kokoro"),
-    ]
+    """Preload TTS models via HTTP for all configured providers. Output: none. Input: none."""
+    endpoints = _active_tts_preload_endpoints()
     for url, name in endpoints:
         try:
             timeout = httpx.Timeout(120.0, connect=5.0)
@@ -295,9 +360,10 @@ async def build_system_snapshot() -> dict[str, Any]:
             fetch_service_status(client, "stt", "http://stt:8001/health", "http://stt:8001/metrics"),
             fetch_service_status(client, "tts-router", "http://tts-router:8002/health", "http://tts-router:8002/metrics"),
             fetch_service_status(client, "tools", "http://tools:8003/health", "http://tools:8003/metrics"),
-            fetch_service_status(client, "piper-en", f"http://piper-en:{os.getenv('PIPER_PORT_EN', '6010')}/", None),
-            fetch_service_status(client, "piper-ru", f"http://piper-ru:{os.getenv('PIPER_PORT_RU', '6011')}/", None),
-            fetch_service_status(client, "kokoro", f"http://kokoro:{os.getenv('KOKORO_PORT', '6030')}/", None),
+            *[
+                fetch_service_status(client, name, preload_url.replace("/preload", "/health"), None)
+                for preload_url, name in _active_tts_preload_endpoints()
+            ],
         )
 
     redis_ok = False
@@ -395,38 +461,42 @@ async def autoload_preload_now() -> dict[str, Any]:
 @app.post("/api/system-reset")
 async def system_reset() -> dict[str, Any]:
     """Trigger full system reset via configured reset backend. Output: status dict. Input: none."""
-    reset_mode = os.getenv("SYSTEM_RESET_MODE", "hook").strip().lower()
+    reset_mode = os.getenv("SYSTEM_RESET_MODE", "command").strip().lower()
     hook_url = os.getenv("SYSTEM_RESET_HOOK_URL", "").strip()
-    reset_command = os.getenv(
-        "SYSTEM_RESET_COMMAND",
-        "docker compose --profile core down && docker compose --profile core up -d",
-    ).strip()
+    reset_command = os.getenv("SYSTEM_RESET_COMMAND", "").strip() or _default_system_reset_command()
     reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
 
     append_system_log("system", "reset.requested", "System reset requested via API.", {"mode": reset_mode})
 
     if reset_mode == "hook":
         if not hook_url:
-            raise HTTPException(status_code=503, detail="SYSTEM_RESET_HOOK_URL is not configured")
-        timeout = httpx.Timeout(15.0, connect=3.0)
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(hook_url, json={"source": "webui-backend", "requested_at": time.time()})
-                resp.raise_for_status()
-            append_system_log("system", "reset.dispatched", "Reset request dispatched to hook.", {"hook_url": hook_url})
-            return {"status": "accepted", "mode": "hook", "message": "Reset hook accepted request."}
-        except Exception as exc:  # noqa: BLE001
-            append_system_log("system", "reset.error", f"Reset hook failed: {exc}", {"hook_url": hook_url})
-            raise HTTPException(status_code=502, detail=f"Reset hook failed: {exc}") from exc
+            reset_mode = "command"
+            append_system_log(
+                "system",
+                "reset.mode_fallback",
+                "SYSTEM_RESET_HOOK_URL is empty, fallback to command mode.",
+                {"cwd": reset_cwd},
+            )
+        else:
+            timeout = httpx.Timeout(15.0, connect=3.0)
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(hook_url, json={"source": "webui-backend", "requested_at": time.time()})
+                    resp.raise_for_status()
+                append_system_log("system", "reset.dispatched", "Reset request dispatched to hook.", {"hook_url": hook_url})
+                return {"status": "accepted", "mode": "hook", "message": "Reset hook accepted request."}
+            except Exception as exc:  # noqa: BLE001
+                append_system_log("system", "reset.error", f"Reset hook failed: {exc}", {"hook_url": hook_url})
+                raise HTTPException(status_code=502, detail=f"Reset hook failed: {exc}") from exc
 
     if reset_mode == "command":
         try:
             subprocess.Popen(
-                ["/bin/sh", "-lc", f"cd '{reset_cwd}' && ({reset_command})"],
+                ["/bin/sh", "-lc", f"cd {shlex.quote(reset_cwd)} && ({reset_command})"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            append_system_log("system", "reset.dispatched", "Reset command started.", {"cwd": reset_cwd})
+            append_system_log("system", "reset.dispatched", "Reset command started.", {"cwd": reset_cwd, "command": reset_command})
             return {"status": "accepted", "mode": "command", "message": "Reset command started."}
         except Exception as exc:  # noqa: BLE001
             append_system_log("system", "reset.error", f"Reset command failed: {exc}", {"cwd": reset_cwd})
@@ -743,13 +813,101 @@ async def _call_tts(text: str) -> dict[str, Any]:
         return {"mode": "error", "error": str(exc), "segments": []}
 
 
+def _split_ready_tts_chunks(text: str, *, flush: bool = False) -> tuple[list[str], str]:
+    """Split buffered LLM text into ready TTS chunks. Output: ready chunks and tail. Input: buffered text and flush flag."""
+    ready_chunks: list[str] = []
+    chunk_start = 0
+    punctuation = {".", "!", "?", ";", ":", "\n"}
+
+    index = 0
+    while index < len(text):
+        char = text[index]
+        current_len = index - chunk_start + 1
+
+        if char in punctuation:
+            chunk = text[chunk_start : index + 1].strip()
+            if chunk:
+                ready_chunks.append(chunk)
+            chunk_start = index + 1
+            index += 1
+            continue
+
+        if current_len >= TTS_STREAM_SOFT_CHUNK_CHARS:
+            window = text[chunk_start : index + 1]
+            split_offset = max(window.rfind(" "), window.rfind("\t"))
+            if split_offset >= TTS_STREAM_MIN_CHUNK_CHARS:
+                split_at = chunk_start + split_offset + 1
+                chunk = text[chunk_start:split_at].strip()
+                if chunk:
+                    ready_chunks.append(chunk)
+                chunk_start = split_at
+
+        index += 1
+
+    tail = text[chunk_start:]
+    if flush:
+        chunk = tail.strip()
+        if chunk:
+            ready_chunks.append(chunk)
+        return ready_chunks, ""
+
+    return ready_chunks, tail
+
+
+async def _stream_tts_chunks(
+    websocket: WebSocket,
+    send_event: Any,
+    queue: asyncio.Queue[tuple[int, str] | None],
+) -> None:
+    """Synthesize and send queued TTS chunks in order. Output: none. Input: websocket sender and text queue."""
+    while True:
+        item = await queue.get()
+        if item is None:
+            queue.task_done()
+            break
+
+        chunk_index, chunk_text = item
+        append_system_log(
+            "tts",
+            "input",
+            "Sentence prepared for TTS stage.",
+            {"chars": len(chunk_text), "text_preview": chunk_text[:200], "chunk_index": chunk_index, "dispatched": True},
+        )
+        tts_payload = await _call_tts(chunk_text)
+        tts_payload["chunk_index"] = chunk_index
+        tts_payload["chunk_text"] = chunk_text
+        tts_payload["streaming"] = True
+        append_system_log(
+            "tts",
+            "result",
+            "TTS chunk completed.",
+            {
+                "chunk_index": chunk_index,
+                "chars": len(chunk_text),
+                "mode": tts_payload.get("mode", "unknown"),
+                "provider": tts_payload.get("provider", ""),
+                "segments": len(tts_payload.get("segments", [])),
+                "error": tts_payload.get("error", ""),
+            },
+        )
+        await send_event({"type": "tts.result", "payload": tts_payload})
+        queue.task_done()
+
+
 async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
     """Stream LLM response tokens back through websocket. Output: none. Input: websocket, session state."""
     base_url = os.getenv("LLM_PROVIDER_PRIMARY_BASE_URL", "").rstrip("/")
     model = os.getenv("LLM_PROVIDER_PRIMARY_MODEL", "")
 
+    websocket_send_lock = asyncio.Lock()
+
+    async def send_event(payload: dict[str, Any]) -> None:
+        """Serialize websocket sends inside one session. Output: none. Input: outbound message payload."""
+        async with websocket_send_lock:
+            await websocket.send_json(payload)
+
     if not base_url or not model:
-        await websocket.send_json({"type": "error", "message": "LLM not configured (check LLM_PROVIDER_PRIMARY_BASE_URL and LLM_PROVIDER_PRIMARY_MODEL)."})
+        await send_event({"type": "error", "message": "LLM not configured (check LLM_PROVIDER_PRIMARY_BASE_URL and LLM_PROVIDER_PRIMARY_MODEL)."})
         return
 
     messages: list[dict[str, str]] = []
@@ -781,12 +939,28 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
             "system_message_preview": messages[0]["content"][:200] if messages and messages[0].get("role") == "system" else "",
         },
     )
+    await send_event({"type": "llm.start"})
 
     request_body = {"model": model, "messages": messages, "stream": True, **reasoning_payload, **temperature_payload}
     url = f"{base_url}/v1/chat/completions"
     timeout = httpx.Timeout(60.0, connect=5.0)
 
     full_response = ""
+    tts_buffer = ""
+    tts_chunk_index = 0
+    tts_queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
+    tts_task = asyncio.create_task(_stream_tts_chunks(websocket, send_event, tts_queue))
+
+    async def handle_token(token: str) -> None:
+        """Accumulate token into response and live TTS queue. Output: none. Input: token text."""
+        nonlocal full_response, tts_buffer, tts_chunk_index
+        full_response += token
+        tts_buffer += token
+        ready_chunks, tts_buffer = _split_ready_tts_chunks(tts_buffer)
+        for chunk_text in ready_chunks:
+            tts_chunk_index += 1
+            await tts_queue.put((tts_chunk_index, chunk_text))
+
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, json=request_body) as resp:
@@ -802,8 +976,8 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
                         chunk = __import__("json").loads(data)
                         token = chunk["choices"][0].get("delta", {}).get("content", "")
                         if token:
-                            full_response += token
-                            await websocket.send_json({"type": "llm.token", "token": token})
+                            await handle_token(token)
+                            await send_event({"type": "llm.token", "token": token})
                     except (KeyError, ValueError):
                         pass
 
@@ -818,7 +992,7 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
                 "Primary LLM failed; switching to fallback provider.",
                 {"error": str(exc), "fallback_model": fallback_model},
             )
-            await websocket.send_json({"type": "llm.warn", "message": f"Primary LLM failed ({exc}), trying fallback."})
+            await send_event({"type": "llm.warn", "message": f"Primary LLM failed ({exc}), trying fallback."})
             fallback_body = {**request_body, "model": fallback_model}
             fallback_endpoint = f"{fallback_url}/v1/chat/completions"
             try:
@@ -836,18 +1010,26 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
                                 chunk = __import__("json").loads(data)
                                 token = chunk["choices"][0].get("delta", {}).get("content", "")
                                 if token:
-                                    full_response += token
-                                    await websocket.send_json({"type": "llm.token", "token": token})
+                                    await handle_token(token)
+                                    await send_event({"type": "llm.token", "token": token})
                             except (KeyError, ValueError):
                                 pass
             except Exception as fb_exc:  # noqa: BLE001
-                await websocket.send_json({"type": "error", "message": f"Fallback LLM also failed: {fb_exc}"})
+                await send_event({"type": "error", "message": f"Fallback LLM also failed: {fb_exc}"})
+                await tts_queue.put(None)
+                await tts_task
                 return
         else:
-            await websocket.send_json({"type": "error", "message": f"LLM request failed: {exc}"})
+            await send_event({"type": "error", "message": f"LLM request failed: {exc}"})
+            await tts_queue.put(None)
+            await tts_task
             return
 
     if full_response:
+        tail_chunks, _ = _split_ready_tts_chunks(tts_buffer, flush=True)
+        for chunk_text in tail_chunks:
+            tts_chunk_index += 1
+            await tts_queue.put((tts_chunk_index, chunk_text))
         session.history.append({"role": "assistant", "content": full_response})
         append_system_log(
             "llm",
@@ -855,26 +1037,9 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
             "LLM response received.",
             {"chars": len(full_response), "text_preview": full_response[:200]},
         )
-        append_system_log(
-            "tts",
-            "input",
-            "Text prepared for TTS stage.",
-            {"chars": len(full_response), "text_preview": full_response[:200], "dispatched": True},
-        )
-        tts_payload = await _call_tts(full_response)
-        append_system_log(
-            "tts",
-            "result",
-            "TTS stage completed.",
-            {
-                "mode": tts_payload.get("mode", "unknown"),
-                "provider": tts_payload.get("provider", ""),
-                "segments": len(tts_payload.get("segments", [])),
-                "error": tts_payload.get("error", ""),
-            },
-        )
-        await websocket.send_json({"type": "llm.done", "text": full_response})
-        await websocket.send_json({"type": "tts.result", "payload": tts_payload})
+        await send_event({"type": "llm.done", "text": full_response})
+    await tts_queue.put(None)
+    await tts_task
 
 
 

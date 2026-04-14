@@ -105,6 +105,8 @@ let ttsSpectrumData = null;
 let ttsSpectrumRafId = null;
 let activePlaybackAudio = null;
 let stopPlaybackRequested = false;
+let ttsPlaybackQueue = [];
+let ttsPlaybackInProgress = false;
 let isResizingLayout = false;
 
 const VAD_PRESETS = {
@@ -564,6 +566,26 @@ async function blobToBase64(blob) {
   return btoa(binary);
 }
 
+// Apply selected playback device to an audio element. Output: whether custom sink is active. Input: HTMLAudioElement.
+async function applyPlaybackDevice(audio) {
+  if (!audio || !selectedOutputDeviceId) {
+    return false;
+  }
+
+  if (typeof audio.setSinkId !== "function") {
+    appendEvent("Playback device selection is not supported in this browser.");
+    return false;
+  }
+
+  try {
+    await audio.setSinkId(selectedOutputDeviceId);
+    return true;
+  } catch (err) {
+    appendEvent(`Playback device apply error: ${err.message || err}`);
+    return false;
+  }
+}
+
 // Play last sent utterance fragment via hidden Audio element. Output: none. Input: none.
 async function playLastChunk() {
   if (!lastChunkBlob) {
@@ -573,15 +595,7 @@ async function playLastChunk() {
   const url = URL.createObjectURL(lastChunkBlob);
   const audio = new Audio(url);
 
-  if (selectedOutputDeviceId && typeof audio.setSinkId === "function") {
-    try {
-      await audio.setSinkId(selectedOutputDeviceId);
-    } catch (err) {
-      appendEvent(`Playback device apply error: ${err.message || err}`);
-    }
-  } else if (selectedOutputDeviceId && typeof audio.setSinkId !== "function") {
-    appendEvent("Playback device selection is not supported in this browser.");
-  }
+  await applyPlaybackDevice(audio);
 
   audio.onended = () => URL.revokeObjectURL(url);
   audio.onerror = () => {
@@ -730,74 +744,118 @@ function finalizeLlmResponse(text) {
   appendEvent(`AI: ${finalText || "(empty)"}`);
 }
 
-// Speak TTS segments via browser speech synthesis as fallback playback. Output: none. Input: TTS payload.
-function playTtsPayload(payload) {
+// Interrupt active TTS playback when a new LLM response starts. Output: none. Input: none.
+function interruptPlaybackForNewLlmResponse() {
+  const hadPlayback = ttsPlaybackInProgress || ttsPlaybackQueue.length > 0 || !!activePlaybackAudio;
+  stopPlaybackRequested = true;
+  ttsPlaybackQueue = [];
+
+  if (activePlaybackAudio) {
+    activePlaybackAudio.pause();
+    activePlaybackAudio = null;
+  }
+
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+  }
+
+  stopPlaybackSpectrum();
+  ttsPlaybackInProgress = false;
+  if (stopPlaybackButton) {
+    stopPlaybackButton.disabled = true;
+  }
+  setPlaybackState("idle", hadPlayback ? "interrupted by new AI response" : "idle");
+}
+
+// Speak TTS segments via browser speech synthesis as fallback playback. Output: promise. Input: TTS payload.
+async function playTtsPayloadNow(payload) {
   if (!payload || payload.mode === "error") {
-    appendEvent(`TTS error: ${payload && payload.error ? payload.error : "unknown error"}`);
-    return;
+    throw new Error(payload && payload.error ? payload.error : "unknown error");
   }
 
   const segments = Array.isArray(payload.segments) ? payload.segments.filter((segment) => segment && segment.text) : [];
   if (segments.length === 0) {
-    appendEvent("TTS returned no playable segments.");
+    throw new Error("TTS returned no playable segments.");
+  }
+
+  if (payload.mode === "server_audio") {
+    await playServerAudioSegments(segments);
+    return;
+  }
+
+  if (!("speechSynthesis" in window)) {
+    throw new Error("browser speech synthesis is not supported");
+  }
+
+  window.speechSynthesis.cancel();
+  await new Promise((resolve) => {
+    const speakNext = (index) => {
+      if (stopPlaybackRequested || index >= segments.length) {
+        resolve();
+        return;
+      }
+      const segment = segments[index];
+      const utterance = new SpeechSynthesisUtterance(segment.text);
+      utterance.lang = segment.locale || "en-US";
+      utterance.onend = () => speakNext(index + 1);
+      utterance.onerror = () => speakNext(index + 1);
+      window.speechSynthesis.speak(utterance);
+    };
+    speakNext(0);
+  });
+}
+
+// Queue TTS payload and start sequential playback if needed. Output: none. Input: TTS payload.
+function playTtsPayload(payload) {
+  if (!payload) {
+    return;
+  }
+
+  ttsPlaybackQueue.push(payload);
+  if (ttsPlaybackInProgress) {
     return;
   }
 
   stopPlaybackRequested = false;
+  ttsPlaybackInProgress = true;
   if (stopPlaybackButton) {
     stopPlaybackButton.disabled = false;
   }
   setPlaybackState("playing", "playing");
 
-  if (payload.mode === "server_audio") {
-    playServerAudioSegments(segments)
-      .then(() => {
-        appendEvent(`TTS playback completed (${segments.length} segment(s), mode=server_audio).`);
-        if (stopPlaybackButton) {
-          stopPlaybackButton.disabled = true;
+  void (async () => {
+    try {
+      while (ttsPlaybackQueue.length > 0) {
+        if (stopPlaybackRequested) {
+          ttsPlaybackQueue = [];
+          break;
         }
+        const nextPayload = ttsPlaybackQueue.shift();
+        if (!nextPayload) {
+          continue;
+        }
+        await playTtsPayloadNow(nextPayload);
+      }
+      if (!stopPlaybackRequested) {
         setPlaybackState("idle", "idle");
-      })
-      .catch((err) => {
-        appendEvent(`TTS server-audio playback error: ${err.message || err}`);
-        if (stopPlaybackButton) {
-          stopPlaybackButton.disabled = true;
-        }
-        setPlaybackState("error", "error");
-      });
-    appendEvent(`TTS playback started (${segments.length} segment(s), mode=server_audio).`);
-    return;
-  }
-
-  if (!("speechSynthesis" in window)) {
-    appendEvent("TTS unavailable: browser speech synthesis is not supported.");
-    return;
-  }
-
-  window.speechSynthesis.cancel();
-  const speakNext = (index) => {
-    if (stopPlaybackRequested || index >= segments.length) {
+      }
+    } catch (err) {
+      appendEvent(`TTS playback error: ${err.message || err}`);
+      setPlaybackState("error", "error");
+      ttsPlaybackQueue = [];
+    } finally {
+      ttsPlaybackInProgress = false;
       if (stopPlaybackButton) {
         stopPlaybackButton.disabled = true;
       }
-      setPlaybackState("idle", "idle");
-      return;
     }
-    const segment = segments[index];
-    const utterance = new SpeechSynthesisUtterance(segment.text);
-    utterance.lang = segment.locale || "en-US";
-    utterance.onend = () => speakNext(index + 1);
-    utterance.onerror = () => speakNext(index + 1);
-    window.speechSynthesis.speak(utterance);
-  };
-
-  appendEvent(`TTS playback started (${segments.length} segment(s), mode=${payload.mode || "unknown"}).`);
-  speakNext(0);
+  })();
 }
 
 // Stop active TTS playback. Output: none. Input: none.
 function stopPlayback() {
   stopPlaybackRequested = true;
+  ttsPlaybackQueue = [];
 
   if (activePlaybackAudio) {
     activePlaybackAudio.pause();
@@ -935,11 +993,12 @@ async function playBlob(blob) {
   const audio = new Audio(url);
   activePlaybackAudio = audio;
 
-  if (selectedOutputDeviceId && typeof audio.setSinkId === "function") {
-    await audio.setSinkId(selectedOutputDeviceId);
+  const customSinkApplied = await applyPlaybackDevice(audio);
+  if (!customSinkApplied) {
+    startPlaybackSpectrum(audio);
+  } else {
+    stopPlaybackSpectrum();
   }
-
-  startPlaybackSpectrum(audio);
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -1371,6 +1430,9 @@ function connectSession() {
         break;
       case "stt.result":
         appendEvent(`STT: ${msg.text || "(empty)"}`);
+        break;
+      case "llm.start":
+        interruptPlaybackForNewLlmResponse();
         break;
       case "llm.token":
         appendLlmToken(msg.token || "");

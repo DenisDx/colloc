@@ -6,3 +6,4 @@ faster-whisper==1.1.1
 requests==2.32.3
 piper-tts==1.4.2
 kokoro-onnx==0.5.0
+torch==2.5.1

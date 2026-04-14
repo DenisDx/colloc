@@ -25,15 +25,22 @@ Optional services:
 
 - `piper-en`, `piper-ru`: per-language Piper FastAPI synthesis endpoints
 - `kokoro`: Kokoro FastAPI synthesis endpoint
+- `silero`: Silero FastAPI synthesis endpoint
 - `asterisk`: SIP endpoint container with baseline configuration
 - `telegram-bot`: optional bot process placeholder
 
 Compose profiles:
 
-- `core`: gateway, backend, redis, tools, stt, tts-router, piper, kokoro
-- `tts`: explicit TTS-related profile
+- `core`: gateway, backend, redis, tools, stt, tts-router
+- `tts`: enables optional TTS engines together with per-engine profiles (`tts-piper-en`, `tts-piper-ru`, `tts-kokoro`, `tts-silero`)
 - `sip`: Asterisk
 - `telegram`: Telegram bot
+
+## Recent Changes
+
+- Added Silero provider support in TTS routing with shared-container addressing and provider fallback.
+- Improved LLM -> TTS live streaming: chunks are dispatched not only on sentence punctuation, but also by soft length threshold for better real-time playback.
+- Added interruption semantics: new LLM answer start clears pending playback queue and interrupts current TTS playback.
 
 ## Repository Layout
 
@@ -252,7 +259,7 @@ HTTP and HTTPS are both available for local access. Use HTTPS when you explicitl
 ### Gateway
 
 ```bash
-curl -fsS "$BASE_URL/healthz"
+curl -fsS "$BASE_URL_HTTP/healthz"
 ```
 
 ### Web UI backend
@@ -282,6 +289,12 @@ curl -fsS "$BASE_URL_HTTP/api/tts/voices" | jq .
 curl -fsS -X POST "$BASE_URL_HTTP/api/tts/synthesize" \
   -H "Content-Type: application/json" \
   -d '{"text":"И Иван сказал: I need an apple"}' | jq .
+
+# Russian-only test (useful for validating Silero route if configured as RU primary):
+curl -fsS -X POST "$BASE_URL_HTTP/api/tts/synthesize" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"Проверка связи прошла успешно: сигнал чистый, помех нет, я на связи и готов к работе."}' \
+  | jq '{mode, provider, providers, fallback_used, segments: (.segments | length), errors}'
 ```
 
 ### Tools service
@@ -305,15 +318,17 @@ docker compose exec redis redis-cli ping
 docker compose exec redis sh -lc 'redis-cli -a "$REDIS_PASSWORD" ping'
 ```
 
-### Piper and Kokoro (container-level checks)
+### Piper, Kokoro and Silero (container-level checks)
 
 ```bash
-docker compose exec piper-en sh -lc 'curl -fsS "http://127.0.0.1:$PIPER_PORT_EN/health"'
-docker compose exec piper-ru sh -lc 'curl -fsS "http://127.0.0.1:$PIPER_PORT_RU/health"'
-docker compose exec kokoro sh -lc 'curl -fsS "http://127.0.0.1:$KOKORO_PORT/health"'
+docker compose exec piper-en sh -lc 'curl -fsS "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/health"'
+docker compose exec piper-ru sh -lc 'curl -fsS "http://127.0.0.1:${TTS_RU_PRIMARY_PORT:-6011}/health"'
+docker compose exec kokoro sh -lc 'curl -fsS "http://127.0.0.1:${KOKORO_PORT:-6030}/health"'
+docker compose exec silero sh -lc 'curl -fsS "http://127.0.0.1:${SILERO_PORT:-6040}/health"'
 
-docker compose exec piper-en sh -lc 'curl -fsS -X POST "http://127.0.0.1:$PIPER_PORT_EN/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Hello from Piper EN\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
-docker compose exec kokoro sh -lc 'curl -fsS -X POST "http://127.0.0.1:$KOKORO_PORT/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Hello from Kokoro\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
+docker compose exec piper-en sh -lc 'curl -fsS -X POST "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Hello from Piper EN\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
+docker compose exec kokoro sh -lc 'curl -fsS -X POST "http://127.0.0.1:${KOKORO_PORT:-6030}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Hello from Kokoro\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
+docker compose exec silero sh -lc 'curl -fsS -X POST "http://127.0.0.1:${SILERO_PORT:-6040}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Проверка синтеза Silero\",\"language\":\"ru\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### Asterisk
@@ -382,32 +397,39 @@ docker compose exec redis redis-cli ping
 ### 7. piper-en
 
 ```bash
-docker compose exec piper-en sh -lc 'curl -fsS "http://127.0.0.1:$PIPER_PORT_EN/health"'
-docker compose exec piper-en sh -lc 'curl -fsS -X POST "http://127.0.0.1:$PIPER_PORT_EN/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"hello\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
+docker compose exec piper-en sh -lc 'curl -fsS "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/health"'
+docker compose exec piper-en sh -lc 'curl -fsS -X POST "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"hello\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### 8. piper-ru
 
 ```bash
-docker compose exec piper-ru sh -lc 'curl -fsS "http://127.0.0.1:$PIPER_PORT_RU/health"'
-docker compose exec piper-ru sh -lc 'curl -fsS -X POST "http://127.0.0.1:$PIPER_PORT_RU/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"привет\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
+docker compose exec piper-ru sh -lc 'curl -fsS "http://127.0.0.1:${TTS_RU_PRIMARY_PORT:-6011}/health"'
+docker compose exec piper-ru sh -lc 'curl -fsS -X POST "http://127.0.0.1:${TTS_RU_PRIMARY_PORT:-6011}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"привет\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### 9. kokoro
 
 ```bash
-docker compose exec kokoro sh -lc 'curl -fsS "http://127.0.0.1:$KOKORO_PORT/health"'
-docker compose exec kokoro sh -lc 'curl -fsS -X POST "http://127.0.0.1:$KOKORO_PORT/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"hello\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
+docker compose exec kokoro sh -lc 'curl -fsS "http://127.0.0.1:${KOKORO_PORT:-6030}/health"'
+docker compose exec kokoro sh -lc 'curl -fsS -X POST "http://127.0.0.1:${KOKORO_PORT:-6030}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"hello\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
 ```
 
-### 10. asterisk
+### 10. silero
+
+```bash
+docker compose exec silero sh -lc 'curl -fsS "http://127.0.0.1:${SILERO_PORT:-6040}/health"'
+docker compose exec silero sh -lc 'curl -fsS -X POST "http://127.0.0.1:${SILERO_PORT:-6040}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"проверка синтеза\",\"language\":\"ru\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
+```
+
+### 11. asterisk
 
 ```bash
 docker compose --profile sip exec asterisk asterisk -rx 'core show uptime'
 docker compose --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
 ```
 
-### 11. telegram-bot
+### 12. telegram-bot
 
 ```bash
 docker compose --profile telegram ps telegram-bot
@@ -610,7 +632,8 @@ curl -s "${LLM_PROVIDER_PRIMARY_BASE_URL}/v1/chat/completions" \
 
 This is the first operational scaffold, not a final production implementation.
 
-- STT/TTS/tools currently provide functional API contracts with placeholder behavior
+- STT and TTS pipeline are functional for real-time operation; tools service is still a scaffold for pluggable tool execution
 - Piper/Kokoro run as real server-side synthesis services; model assets are downloaded on first use
+- Silero runs as a real server-side synthesis service and requires PyTorch in the runtime image
 - SIP flow is baseline-configured and requires telephony hardening for production
 - Security hardening beyond container defaults (secrets manager, firewall policies, IDS, SIEM) is out of scope for this first version
