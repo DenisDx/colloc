@@ -21,6 +21,15 @@ log() {
 log "Colloc service starting (PID $$)"
 cd "$PROJECT_ROOT"
 
+# Load project environment variables for hook runtime settings.
+if [[ -f "$PROJECT_ROOT/.env" ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$PROJECT_ROOT/.env"
+    set +a
+    log "Loaded environment from .env"
+fi
+
 # Start: System restart hook (background)
 log "Starting system restart hook listener on port 9999..."
 python3 "$PROJECT_ROOT/scripts/restart-service-hook.py" >> "$PROJECT_ROOT/logs/service.log" 2>&1 &

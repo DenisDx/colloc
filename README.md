@@ -45,6 +45,7 @@ Compose profiles:
 
 - Added secure system restart service (`colloc_service.sh`, `colloc.service`) with webhook-based restart hook (no Docker socket mounting).
 - Renamed "Reset system" button to "Restart system" for clarity.
+- Added `Stop services` / `Start services` buttons in Web UI to temporarily stop non-core services and restore them.
 - Added README section for system service setup and troubleshooting.
 - Silero TTS provider with per-language routing and provider fallback.
 - LLM -> TTS live streaming: chunks dispatched by soft length threshold for better real-time playback.
@@ -150,6 +151,45 @@ sudo journalctl -u colloc.service -f
 ```
 
 **Note:** The "Restart system" button is optional. The Docker stack works fine without this service. If the service is not installed, clicking the button will show a connection error (expected).
+
+### 4.2 Web UI Service Control Buttons (Stop/Start)
+
+The Web UI has two additional control buttons:
+
+- `Stop services`: stops running services except a protected keep-list.
+- `Start services`: starts back services that were stopped by the previous action.
+
+Default keep-list:
+
+- `gateway`
+- `webui-backend`
+- `redis`
+
+The host hook persists the stopped service set to:
+
+- `logs/service-control-state.json`
+
+Environment variables:
+
+- `SYSTEM_SERVICE_CONTROL_KEEP_SERVICES`: comma-separated service names to keep running.
+- `SYSTEM_RESET_HOOK_BIND_HOST`: host bind address for restart hook (`0.0.0.0` recommended).
+- `SYSTEM_STOP_SERVICES_COMMAND`: command used only in `SYSTEM_RESET_MODE=command` for stop action.
+- `SYSTEM_START_SERVICES_COMMAND`: command used only in `SYSTEM_RESET_MODE=command` for start action.
+
+Examples for `SYSTEM_RESET_MODE=command`:
+
+```bash
+SYSTEM_STOP_SERVICES_COMMAND="docker compose stop stt tts-router tools silero kokoro piper-en piper-ru sip-service sip-ari asterisk"
+SYSTEM_START_SERVICES_COMMAND="docker compose up -d stt tts-router tools silero kokoro piper-en piper-ru sip-service sip-ari asterisk"
+```
+
+If you use `SYSTEM_RESET_MODE=hook`, these command variables may stay empty.
+
+After changing these variables, restart host service:
+
+```bash
+sudo systemctl restart colloc.service
+```
 
 5. Build and start full stack (core + TTS + SIP):
 

@@ -146,6 +146,16 @@ def _default_system_reset_command() -> str:
     return f"{compose_base} down && {compose_base} up -d"
 
 
+def _derive_hook_url(base_hook_url: str, endpoint: str) -> str:
+    """Build hook URL from reset hook URL and endpoint. Output: URL string. Input: base URL and endpoint path."""
+    cleaned = base_hook_url.strip()
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/restart-services"):
+        return f"{cleaned.rsplit('/restart-services', 1)[0]}{endpoint}"
+    return f"{cleaned.rstrip('/')}{endpoint}"
+
+
 async def _preload_tts() -> None:
     """Preload TTS models via HTTP for all configured providers. Output: none. Input: none."""
     endpoints = _active_tts_preload_endpoints()
@@ -700,6 +710,92 @@ async def system_reset() -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             append_system_log("system", "reset.error", f"Reset command failed: {exc}", {"cwd": reset_cwd})
             raise HTTPException(status_code=500, detail=f"Reset command failed: {exc}") from exc
+
+    raise HTTPException(status_code=400, detail="Unsupported SYSTEM_RESET_MODE. Use 'hook' or 'command'.")
+
+
+@app.post("/api/system-stop-services")
+async def system_stop_services() -> dict[str, Any]:
+    """Stop non-core services via hook/command backend. Output: status dict. Input: none."""
+    reset_mode = os.getenv("SYSTEM_RESET_MODE", "command").strip().lower()
+    hook_url = _derive_hook_url(os.getenv("SYSTEM_RESET_HOOK_URL", "").strip(), "/stop-services")
+    stop_command = os.getenv("SYSTEM_STOP_SERVICES_COMMAND", "").strip()
+    reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
+
+    append_system_log("system", "stop_services.requested", "Stop services requested via API.", {"mode": reset_mode})
+
+    if reset_mode == "hook":
+        if not hook_url:
+            raise HTTPException(status_code=400, detail="SYSTEM_RESET_HOOK_URL is empty for hook mode.")
+        timeout = httpx.Timeout(30.0, connect=3.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(hook_url, json={"source": "webui-backend", "requested_at": time.time()})
+                resp.raise_for_status()
+                payload = resp.json() if resp.content else {}
+            append_system_log("system", "stop_services.dispatched", "Stop services request dispatched to hook.", {"hook_url": hook_url})
+            return {"status": "accepted", "mode": "hook", **payload}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "stop_services.error", f"Stop services hook failed: {exc}", {"hook_url": hook_url})
+            raise HTTPException(status_code=502, detail=f"Stop services hook failed: {exc}") from exc
+
+    if reset_mode == "command":
+        if not stop_command:
+            raise HTTPException(status_code=400, detail="SYSTEM_STOP_SERVICES_COMMAND is empty for command mode.")
+        try:
+            subprocess.Popen(
+                ["/bin/sh", "-lc", f"cd {shlex.quote(reset_cwd)} && ({stop_command})"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            append_system_log("system", "stop_services.dispatched", "Stop services command started.", {"cwd": reset_cwd})
+            return {"status": "accepted", "mode": "command", "message": "Stop services command started."}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "stop_services.error", f"Stop services command failed: {exc}", {"cwd": reset_cwd})
+            raise HTTPException(status_code=500, detail=f"Stop services command failed: {exc}") from exc
+
+    raise HTTPException(status_code=400, detail="Unsupported SYSTEM_RESET_MODE. Use 'hook' or 'command'.")
+
+
+@app.post("/api/system-start-services")
+async def system_start_services() -> dict[str, Any]:
+    """Start previously stopped services via hook/command backend. Output: status dict. Input: none."""
+    reset_mode = os.getenv("SYSTEM_RESET_MODE", "command").strip().lower()
+    hook_url = _derive_hook_url(os.getenv("SYSTEM_RESET_HOOK_URL", "").strip(), "/start-services")
+    start_command = os.getenv("SYSTEM_START_SERVICES_COMMAND", "").strip()
+    reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
+
+    append_system_log("system", "start_services.requested", "Start services requested via API.", {"mode": reset_mode})
+
+    if reset_mode == "hook":
+        if not hook_url:
+            raise HTTPException(status_code=400, detail="SYSTEM_RESET_HOOK_URL is empty for hook mode.")
+        timeout = httpx.Timeout(30.0, connect=3.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(hook_url, json={"source": "webui-backend", "requested_at": time.time()})
+                resp.raise_for_status()
+                payload = resp.json() if resp.content else {}
+            append_system_log("system", "start_services.dispatched", "Start services request dispatched to hook.", {"hook_url": hook_url})
+            return {"status": "accepted", "mode": "hook", **payload}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "start_services.error", f"Start services hook failed: {exc}", {"hook_url": hook_url})
+            raise HTTPException(status_code=502, detail=f"Start services hook failed: {exc}") from exc
+
+    if reset_mode == "command":
+        if not start_command:
+            raise HTTPException(status_code=400, detail="SYSTEM_START_SERVICES_COMMAND is empty for command mode.")
+        try:
+            subprocess.Popen(
+                ["/bin/sh", "-lc", f"cd {shlex.quote(reset_cwd)} && ({start_command})"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            append_system_log("system", "start_services.dispatched", "Start services command started.", {"cwd": reset_cwd})
+            return {"status": "accepted", "mode": "command", "message": "Start services command started."}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "start_services.error", f"Start services command failed: {exc}", {"cwd": reset_cwd})
+            raise HTTPException(status_code=500, detail=f"Start services command failed: {exc}") from exc
 
     raise HTTPException(status_code=400, detail="Unsupported SYSTEM_RESET_MODE. Use 'hook' or 'command'.")
 

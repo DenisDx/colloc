@@ -2,6 +2,8 @@ const connectButton = document.getElementById("connect-btn");
 const startButton = document.getElementById("start-btn");
 const stopButton = document.getElementById("stop-btn");
 const resetSystemButton = document.getElementById("reset-system-btn");
+const stopServicesButton = document.getElementById("stop-services-btn");
+const startServicesButton = document.getElementById("start-services-btn");
 const playChunkButton = document.getElementById("play-chunk-btn");
 const stopPlaybackButton = document.getElementById("stop-playback-btn");
 const playbackStateNode = document.getElementById("playback-state");
@@ -112,6 +114,7 @@ let ttsPlaybackQueue = [];
 let ttsPlaybackInProgress = false;
 let isResizingLayout = false;
 let autoloadStatusRequestInFlight = false;
+let serviceControlRequestInFlight = false;
 
 const VAD_PRESETS = {
   near: { relaxation: 0.06, activation: 0.18, floorMin: 0.035 },
@@ -734,6 +737,7 @@ async function refreshAutoloadStatus() {
     return;
   }
   autoloadStatusRequestInFlight = true;
+  syncControlButtons();
   try {
     const response = await fetch("/api/autoload-status");
     if (!response.ok) {
@@ -746,6 +750,7 @@ async function refreshAutoloadStatus() {
     appendEvent(`Keep-models-loaded status error: ${err.message || err}`);
   } finally {
     autoloadStatusRequestInFlight = false;
+    syncControlButtons();
   }
 }
 
@@ -771,7 +776,7 @@ async function setAutoloadEnabled(enabled) {
     autoloadToggle.checked = !enabled;
     appendEvent(`Keep-models-loaded toggle error: ${err.message || err}`);
   } finally {
-    autoloadToggle.disabled = false;
+    syncControlButtons();
   }
 }
 
@@ -1141,6 +1146,13 @@ function syncControlButtons() {
   if (stopButton) {
     stopButton.disabled = !isMicrophoneRecording();
   }
+  const sessionReady = isSessionConnected();
+  if (reasoningToggle) {
+    reasoningToggle.disabled = !sessionReady;
+  }
+  if (autoloadToggle) {
+    autoloadToggle.disabled = !sessionReady || autoloadStatusRequestInFlight;
+  }
 }
 
 // Request backend-triggered system restart. Output: none. Input: none.
@@ -1169,6 +1181,77 @@ async function resetSystem() {
     appendEvent(`System restart failed: ${err.message || err}`);
   } finally {
     resetSystemButton.disabled = false;
+  }
+}
+
+// Request host hook to stop all non-core/non-UI services. Output: none. Input: none.
+async function stopServices() {
+  if (!stopServicesButton || serviceControlRequestInFlight) {
+    return;
+  }
+  const confirmed = window.confirm("This will stop non-core services and keep Web UI/core alive. Continue?");
+  if (!confirmed) {
+    return;
+  }
+
+  serviceControlRequestInFlight = true;
+  stopServicesButton.disabled = true;
+  if (startServicesButton) {
+    startServicesButton.disabled = true;
+  }
+  try {
+    const response = await fetch("/api/system-stop-services", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: "manual-ui-request" }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
+    }
+    const stopped = Array.isArray(payload.stopped_services) ? payload.stopped_services.join(", ") : "none";
+    appendEvent(`Stop services requested: ${payload.message || "accepted"}. Stopped: ${stopped}.`);
+  } catch (err) {
+    appendEvent(`Stop services failed: ${err.message || err}`);
+  } finally {
+    serviceControlRequestInFlight = false;
+    stopServicesButton.disabled = false;
+    if (startServicesButton) {
+      startServicesButton.disabled = false;
+    }
+  }
+}
+
+// Request host hook to start services that were stopped by Stop services. Output: none. Input: none.
+async function startServices() {
+  if (!startServicesButton || serviceControlRequestInFlight) {
+    return;
+  }
+  serviceControlRequestInFlight = true;
+  startServicesButton.disabled = true;
+  if (stopServicesButton) {
+    stopServicesButton.disabled = true;
+  }
+  try {
+    const response = await fetch("/api/system-start-services", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: "manual-ui-request" }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
+    }
+    const started = Array.isArray(payload.started_services) ? payload.started_services.join(", ") : "none";
+    appendEvent(`Start services requested: ${payload.message || "accepted"}. Started: ${started}.`);
+  } catch (err) {
+    appendEvent(`Start services failed: ${err.message || err}`);
+  } finally {
+    serviceControlRequestInFlight = false;
+    startServicesButton.disabled = false;
+    if (stopServicesButton) {
+      stopServicesButton.disabled = false;
+    }
   }
 }
 
@@ -1453,6 +1536,7 @@ function connectSession() {
   socket.addEventListener("open", () => {
     setVoiceState("connected");
     appendEvent("WebSocket connected.");
+    refreshAutoloadStatus();
     syncControlButtons();
   });
 
@@ -1511,6 +1595,12 @@ function connectSession() {
     }
     setVoiceState("disconnected");
     appendEvent("WebSocket closed.");
+    if (autoloadToggle) {
+      autoloadToggle.disabled = true;
+    }
+    if (reasoningToggle) {
+      reasoningToggle.disabled = true;
+    }
     syncControlButtons();
   });
 
@@ -1832,6 +1922,12 @@ stopButton.addEventListener("click", stopMicrophone);
 if (resetSystemButton) {
   resetSystemButton.addEventListener("click", resetSystem);
 }
+if (stopServicesButton) {
+  stopServicesButton.addEventListener("click", stopServices);
+}
+if (startServicesButton) {
+  startServicesButton.addEventListener("click", startServices);
+}
 playChunkButton.addEventListener("click", playLastChunk);
 if (stopPlaybackButton) {
   stopPlaybackButton.addEventListener("click", stopPlayback);
@@ -1912,6 +2008,11 @@ if (temperatureInput) {
 }
 if (autoloadToggle) {
   autoloadToggle.addEventListener("change", () => {
+    if (!isSessionConnected()) {
+      autoloadToggle.checked = false;
+      appendEvent("Connect session first.");
+      return;
+    }
     setAutoloadEnabled(autoloadToggle.checked);
   });
 }
@@ -1921,4 +2022,9 @@ setCalibrationState("idle");
 renderTemperatureValue();
 stopPlaybackSpectrum();
 setPlaybackState("idle", "idle");
-refreshAutoloadStatus();
+if (autoloadToggle) {
+  autoloadToggle.disabled = true;
+}
+if (reasoningToggle) {
+  reasoningToggle.disabled = true;
+}
