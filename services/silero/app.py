@@ -1,5 +1,6 @@
 import base64
 import io
+import logging
 import os
 import wave
 from collections import defaultdict
@@ -15,6 +16,8 @@ app = FastAPI(title="colloc-silero")
 REQUESTS_TOTAL = 0
 REQUESTS_BY_PATH: dict[str, int] = defaultdict(int)
 _MODEL_CACHE: dict[str, Any] = {}
+_MODEL_DEVICE_CACHE: dict[str, str] = {}
+logger = logging.getLogger(__name__)
 
 SUPPORTED_LANGUAGES = {"ru", "en", "de", "es", "fr", "tt", "indic", "ua"}
 SAMPLE_RATE = 48000
@@ -52,6 +55,23 @@ def _default_voice() -> str:
     return os.getenv("SILERO_VOICE", "").strip().lower()
 
 
+def _get_device() -> str:
+    """Get configured device for Silero. Output: device string (cpu/cuda). Input: none."""
+    import torch  # type: ignore[import]
+
+    device_config = os.getenv("SILERO_DEVICE", "cpu").lower()
+    if device_config in {"cuda", "gpu", "vram"} and torch.cuda.is_available():
+        return "cuda"
+    if device_config in {"cuda", "gpu", "vram"} and not torch.cuda.is_available():
+        logger.warning("SILERO_DEVICE=%s requested, but CUDA is unavailable. Falling back to CPU.", device_config)
+    return "cpu"
+
+
+def _model_device(language: str) -> str:
+    """Read cached model device for language. Output: device string. Input: language code."""
+    return _MODEL_DEVICE_CACHE.get(language, "unknown")
+
+
 def _model_id(language: str) -> str:
     """Return Silero model id for language. Output: model id string. Input: language code."""
     configured = os.getenv("SILERO_MODEL_ID", "").strip()
@@ -71,10 +91,20 @@ def _model_url(language: str) -> str:
 
 def _get_model(language: str) -> Any:
     """Load and cache Silero model for a language. Output: Silero model. Input: language code."""
-    if language in _MODEL_CACHE:
-        return _MODEL_CACHE[language]
-
     import torch  # type: ignore[import]
+    desired_device_name = _get_device()
+
+    if language in _MODEL_CACHE:
+        model = _MODEL_CACHE[language]
+        # Keep cached model aligned with current runtime device setting.
+        model_dev = _model_device(language)
+        if desired_device_name == "cuda" and not model_dev.startswith("cuda"):
+            model.to(torch.device("cuda"))
+            _MODEL_DEVICE_CACHE[language] = "cuda"
+        elif desired_device_name == "cpu" and not model_dev.startswith("cpu"):
+            model.to(torch.device("cpu"))
+            _MODEL_DEVICE_CACHE[language] = "cpu"
+        return model
 
     model_dir = _model_dir()
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -92,10 +122,11 @@ def _get_model(language: str) -> Any:
             raise HTTPException(status_code=502, detail=f"Failed to download Silero model {url}: {exc}") from exc
 
     try:
-        device = torch.device("cpu")
+        device = torch.device(desired_device_name)
         model = torch.package.PackageImporter(str(model_path)).load_pickle("tts_models", "model")
         model.to(device)
         _MODEL_CACHE[language] = model
+        _MODEL_DEVICE_CACHE[language] = desired_device_name
         return model
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to load Silero model for {language}: {exc}") from exc
@@ -181,7 +212,14 @@ def list_speakers() -> dict[str, object]:
 @app.get("/metrics")
 def metrics() -> dict[str, object]:
     """Return service metrics. Output: metrics dict. Input: none."""
+    import torch  # type: ignore[import]
     import resource as _resource
+
+    loaded_devices: dict[str, str] = {lang: _model_device(lang) for lang in _MODEL_CACHE}
+    if loaded_devices:
+        effective_device = "gpu" if any(dev.startswith("cuda") for dev in loaded_devices.values()) else "cpu"
+    else:
+        effective_device = "gpu" if _get_device() == "cuda" else "cpu"
 
     return {
         "service": "silero",
@@ -189,6 +227,10 @@ def metrics() -> dict[str, object]:
         "requests_total": REQUESTS_TOTAL,
         "requests_by_path": dict(REQUESTS_BY_PATH),
         "memory_mb": round(_resource.getrusage(_resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2),
+        "device": effective_device,
+        "configured_device": _get_device(),
+        "cuda_available": torch.cuda.is_available(),
+        "model_devices": loaded_devices,
         "models_loaded": list(_MODEL_CACHE.keys()),
         "default_language": _default_language(),
         "default_voice": _default_voice(),

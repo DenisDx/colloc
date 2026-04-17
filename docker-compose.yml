@@ -89,6 +89,13 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     command:
       - /opt/venv/bin/uvicorn
       - webui.backend.app:app
@@ -342,6 +349,13 @@ services:
     profiles:
       - tts
       - tts-silero
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
       PYTHONPATH: /app
       VIRTUAL_ENV: /opt/venv
@@ -349,6 +363,7 @@ services:
       SYSTEM_LOG_PATH: /srv/logs/system.log
       TMPDIR: /srv/data/tmp
       SILERO_MODEL_DIR: /srv/data/silero-models
+      SILERO_DEVICE: ${SILERO_DEVICE}
     command:
       - /opt/venv/bin/uvicorn
       - services.silero.app:app

@@ -36,23 +36,35 @@ Compose profiles:
 - `sip`: Asterisk
 - `telegram`: Telegram bot
 
+## Related Documentation
+
+- [SPEC.md](SPEC.md) — Project specification and design
+- [AGENTS.md](AGENTS.md) — Agent workflow and development rules
+
 ## Recent Changes
 
-- Added Silero provider support in TTS routing with shared-container addressing and provider fallback.
-- Improved LLM -> TTS live streaming: chunks are dispatched not only on sentence punctuation, but also by soft length threshold for better real-time playback.
-- Added interruption semantics: new LLM answer start clears pending playback queue and interrupts current TTS playback.
+- Added secure system restart service (`colloc_service.sh`, `colloc.service`) with webhook-based restart hook (no Docker socket mounting).
+- Renamed "Reset system" button to "Restart system" for clarity.
+- Added README section for system service setup and troubleshooting.
+- Silero TTS provider with per-language routing and provider fallback.
+- LLM -> TTS live streaming: chunks dispatched by soft length threshold for better real-time playback.
+- Interruption semantics: new LLM answer clears pending playback queue.
 
 ## Repository Layout
 
 - `docker-compose.yml`: main stack
 - `docker-compose.override.yml`: local development overrides with hot reload for FastAPI services
 - `docker-compose.publish.yml`: optional publication of STT/TTS service ports
+- `install.sh`: setup script for project-local directories and systemd service generation
+- `colloc_service.sh`: auxiliary system service entry point (manages host-side services)
+- `colloc.service`: generated systemd unit (created by `install.sh`, can be installed system-wide)
 - `gateway/`: Nginx templates and startup script
 - `webui/frontend/`: static frontend
 - `webui/backend/`: FastAPI backend
 - `services/stt/`: STT FastAPI service
 - `services/tts_router/`: TTS routing FastAPI service
 - `services/tools/`: tools FastAPI service
+- `scripts/restart-service-hook.py`: HTTP hook listener for container-triggered system restarts
 - `asterisk/`: Asterisk image and config
 
 ## Installation and Startup
@@ -83,7 +95,61 @@ chmod +x install.sh
 ./install.sh
 ```
 
-This step creates required folders in the workspace and ensures writable runtime paths for model preload under `./data`.
+This step creates required folders in the workspace and ensures writable runtime paths for model preload under `./data`. It also generates `colloc.service` systemd unit file and attempts automatic installation.
+
+### 4.1 System Service Installation (for automatic Restart button)
+
+The `Restart system` button in the Web UI requires a listener service on the host to restart Docker Compose services.
+
+**How it works:**
+
+The `./install.sh` script will:
+1. Generate `colloc.service` systemd unit file (automatically)
+2. Attempt to create `/etc/sudoers.d/colloc-system-service` for passwordless sudo (if possible)
+3. Attempt to install the service system-wide (if passwordless sudo is available)
+
+**Option 1: Let install.sh handle it (Recommended)**
+
+Just run:
+
+```bash
+./install.sh
+```
+
+If you have passwordless sudo configured, the service will be installed automatically. If not, you'll see instructions to enable it.
+
+**Option 2: Manual Installation**
+
+If automatic installation doesn't work or you prefer manual setup:
+
+```bash
+# 1. Create sudoers entry (copy the one printed by install.sh, or use this template):
+sudo tee /etc/sudoers.d/colloc-system-service > /dev/null << 'EOF'
+# Colloc system service: allow passwordless systemd operations
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/cp /path/to/colloc/colloc.service /etc/systemd/system/
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl daemon-reload
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl enable colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl start colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl restart colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl stop colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl status colloc.service
+EOF
+
+# 2. Install the service:
+sudo cp colloc.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable colloc.service
+sudo systemctl start colloc.service
+```
+
+**Verify Installation:**
+
+```bash
+sudo systemctl status colloc.service
+sudo journalctl -u colloc.service -f
+```
+
+**Note:** The "Restart system" button is optional. The Docker stack works fine without this service. If the service is not installed, clicking the button will show a connection error (expected).
 
 5. Build and start full stack (core + TTS + SIP):
 

@@ -1,6 +1,7 @@
 import base64
 import io
 import os
+import resource
 import wave
 from collections import defaultdict
 from pathlib import Path
@@ -141,6 +142,19 @@ def voices() -> dict[str, object]:
     """Return available Kokoro voices. Output: voices dict. Input: none."""
     model = _get_model()
     return {"voices": model.get_voices(), "default_voice": os.getenv("KOKORO_VOICE", "")}
+
+
+@app.get("/metrics")
+def metrics() -> dict[str, object]:
+    """Return service metrics. Output: metrics dict. Input: none."""
+    return {
+        "service": "kokoro",
+        "health": "ok",
+        "requests_total": REQUESTS_TOTAL,
+        "requests_by_path": dict(REQUESTS_BY_PATH),
+        "memory_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2),
+        "device": "cpu",
+    }
 
 
 @app.post("/synthesize")

@@ -15,6 +15,35 @@ import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
 
+try:
+    import pynvml as _pynvml
+
+    nvmlInit = getattr(_pynvml, "nvmlInit", None)
+    nvmlGetDeviceCount = getattr(_pynvml, "nvmlGetDeviceCount", getattr(_pynvml, "nvmlDeviceGetCount", None))
+    nvmlGetDeviceByIndex = getattr(
+        _pynvml,
+        "nvmlGetDeviceByIndex",
+        getattr(_pynvml, "nvmlDeviceGetHandleByIndex", None),
+    )
+    nvmlDeviceGetMemoryInfo = getattr(_pynvml, "nvmlDeviceGetMemoryInfo", None)
+    NVMLError = getattr(_pynvml, "NVMLError", Exception)
+
+    PYNVML_AVAILABLE = all(
+        callable(func) for func in (nvmlInit, nvmlGetDeviceCount, nvmlGetDeviceByIndex, nvmlDeviceGetMemoryInfo)
+    )
+    if PYNVML_AVAILABLE:
+        try:
+            nvmlInit()
+        except Exception:
+            PYNVML_AVAILABLE = False
+except ImportError:
+    PYNVML_AVAILABLE = False
+    nvmlInit = None
+    nvmlGetDeviceCount = None
+    nvmlGetDeviceByIndex = None
+    nvmlDeviceGetMemoryInfo = None
+    NVMLError = Exception
+
 
 app = FastAPI(title="colloc-webui-backend")
 REQUESTS_TOTAL = 0
@@ -289,8 +318,11 @@ def get_memory_usage_mb() -> float:
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2)
 
 
-def get_host_memory_snapshot() -> dict[str, float]:
-    """Get host memory snapshot. Output: memory dict. Input: none."""
+def get_host_memory_snapshot() -> dict[str, Any]:
+    """Get host memory snapshot. Output: memory dict with RAM and VRAM. Input: none."""
+    result: dict[str, Any] = {}
+    
+    # Get RAM from /proc/meminfo
     meminfo: dict[str, int] = {}
     with open("/proc/meminfo", encoding="utf-8") as handle:
         for line in handle:
@@ -301,12 +333,125 @@ def get_host_memory_snapshot() -> dict[str, float]:
     available_kb = meminfo.get("MemAvailable", 0)
     used_kb = max(total_kb - available_kb, 0)
 
-    return {
+    result["ram"] = {
         "total_mb": round(total_kb / 1024.0, 2),
         "used_mb": round(used_kb / 1024.0, 2),
         "available_mb": round(available_kb / 1024.0, 2),
         "used_percent": round((used_kb / total_kb) * 100, 2) if total_kb else 0.0,
     }
+    
+    # Get VRAM using pynvml
+    if PYNVML_AVAILABLE:
+        try:
+            device_count = nvmlGetDeviceCount()
+            if device_count > 0:
+                # Get first GPU
+                device = nvmlGetDeviceByIndex(0)
+                mem_info = nvmlDeviceGetMemoryInfo(device)
+                result["vram"] = {
+                    "total_mb": round(mem_info.total / (1024 * 1024), 2),
+                    "used_mb": round(mem_info.used / (1024 * 1024), 2),
+                    "available_mb": round(mem_info.free / (1024 * 1024), 2),
+                    "used_percent": round((mem_info.used / mem_info.total) * 100, 2) if mem_info.total > 0 else 0.0,
+                }
+            else:
+                result["vram"] = {"error": "No NVIDIA GPU detected"}
+        except NVMLError as exc:
+            result["vram"] = {"error": f"NVIDIA driver error: {exc}"}
+        except Exception as exc:  # noqa: BLE001
+            result["vram"] = {"error": f"Failed to query VRAM: {exc}"}
+    else:
+        result["vram"] = {"error": "pynvml not available in venv (install pynvml or nvidia-ml-py)"}
+    
+    return result
+
+
+async def get_ollama_models() -> dict[str, Any]:
+    """Get loaded models from ollama. Output: models dict. Input: none."""
+    try:
+        ollama_base_url = os.getenv("LLM_PROVIDER_PRIMARY_BASE_URL", "http://ollama:11434").rstrip("/")
+        timeout = httpx.Timeout(2.0, connect=1.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{ollama_base_url}/api/ps")
+            resp.raise_for_status()
+            data = resp.json()
+            models = {}
+            for model in data.get("models", []):
+                name = model.get("name", "unknown")
+                size = model.get("size", 0)
+                models[name] = {
+                    "size_mb": round(size / (1024 * 1024), 2),
+                    "size_gb": round(size / (1024 * 1024 * 1024), 2),
+                }
+            return {"loaded_models": models}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+async def get_service_models_memory() -> dict[str, Any]:
+    """Get loaded models info from our services with device info. Output: models dict. Input: none."""
+    result: dict[str, Any] = {}
+    
+    timeout = httpx.Timeout(2.0, connect=1.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Get piper info (CPU/GPU device aware)
+        for lang in ["en", "ru", "zh"]:
+            try:
+                resp = await client.get(f"http://piper-{lang}:6020/metrics", timeout=timeout)
+                if resp.status_code == 200:
+                    metrics = resp.json()
+                    if "piper" not in result:
+                        result["piper"] = {}
+                    result["piper"][lang] = {
+                        "cached_voices": metrics.get("cached_voices", []),
+                        "active_voice": metrics.get("active_voice"),
+                        "memory_mb": metrics.get("memory_mb"),
+                        "device": metrics.get("device", "cpu"),
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+        
+        # Get kokoro info
+        try:
+            resp = await client.get("http://kokoro:6030/metrics", timeout=timeout)
+            if resp.status_code == 200:
+                metrics = resp.json()
+                result["kokoro"] = {
+                    "health": metrics.get("health", "unknown"),
+                    "memory_mb": metrics.get("memory_mb"),
+                    "device": metrics.get("device", "cpu"),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # Get silero info
+        try:
+            resp = await client.get("http://silero:6040/metrics", timeout=timeout)
+            if resp.status_code == 200:
+                metrics = resp.json()
+                result["silero"] = {
+                    "models_loaded": metrics.get("models_loaded", []),
+                    "memory_mb": metrics.get("memory_mb"),
+                    "device": metrics.get("device", "cpu"),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # Get STT info
+        try:
+            resp = await client.get("http://stt:8001/metrics", timeout=timeout)
+            if resp.status_code == 200:
+                metrics = resp.json()
+                result["stt"] = {
+                    "memory_mb": metrics.get("memory_mb"),
+                    "model": metrics.get("models", {}).get("stt_model"),
+                    "device": metrics.get("models", {}).get("stt_device", "gpu"),
+                    "compute_type": metrics.get("models", {}).get("stt_compute_type"),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+    
+    return result
 
 
 @app.middleware("http")
@@ -451,6 +596,10 @@ async def build_system_snapshot() -> dict[str, Any]:
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "runtime": build_runtime_snapshot(),
         "host_memory": get_host_memory_snapshot(),
+        "models": {
+            "ollama": await get_ollama_models(),
+            "services": await get_service_models_memory(),
+        },
         "services": checks,
     }
 
@@ -510,13 +659,13 @@ async def autoload_preload_now() -> dict[str, Any]:
 
 @app.post("/api/system-reset")
 async def system_reset() -> dict[str, Any]:
-    """Trigger full system reset via configured reset backend. Output: status dict. Input: none."""
+    """Trigger full system restart via configured reset backend. Output: status dict. Input: none."""
     reset_mode = os.getenv("SYSTEM_RESET_MODE", "command").strip().lower()
     hook_url = os.getenv("SYSTEM_RESET_HOOK_URL", "").strip()
     reset_command = os.getenv("SYSTEM_RESET_COMMAND", "").strip() or _default_system_reset_command()
     reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
 
-    append_system_log("system", "reset.requested", "System reset requested via API.", {"mode": reset_mode})
+    append_system_log("system", "reset.requested", "System restart requested via API.", {"mode": reset_mode})
 
     if reset_mode == "hook":
         if not hook_url:
@@ -582,6 +731,20 @@ def metrics() -> dict[str, object]:
 async def system_status() -> dict[str, Any]:
     """Return system status snapshot. Output: snapshot dict. Input: none."""
     return await build_system_snapshot()
+
+
+@app.get("/api/memory")
+async def memory_info() -> dict[str, Any]:
+    """Return detailed memory and models info. Output: memory snapshot dict. Input: none."""
+    return {
+        "type": "memory.snapshot",
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "host_memory": get_host_memory_snapshot(),
+        "models": {
+            "ollama": await get_ollama_models(),
+            "services": await get_service_models_memory(),
+        },
+    }
 
 
 @app.get("/api/log")

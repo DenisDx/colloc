@@ -125,6 +125,18 @@ class BargeInRequest(BaseModel):
     channel_id: str
 
 
+class SipHangupRequest(BaseModel):
+    """Input model for hanging up a SIP call from tools."""
+
+    channel_id: str
+
+
+class SipTransferRequest(BaseModel):
+    """Input model for blind-transferring a SIP call to another extension."""
+
+    channel_id: str
+    target: str
+
 class RtpEndpoint(asyncio.DatagramProtocol):
     """Bidirectional RTP endpoint for one External Media channel."""
 
@@ -502,7 +514,7 @@ async def evaluate_barge_in_candidate(call: CallSession, pcm8k: bytes) -> None:
     }
     append_system_log("sip", "barge_stt_start", "Barge-in candidate STT started.", details)
     try:
-        transcript = await call_stt_from_pcm8k(pcm8k, call.language, source="barge")
+        transcript = await call_stt_from_pcm8k(pcm8k, None, source="barge")
     except Exception:
         logger.exception("Barge-in STT failed for call %s", call.channel_id)
         append_system_log("sip", "barge_stt_error", "Barge-in candidate STT failed.", details)
@@ -525,8 +537,8 @@ async def evaluate_barge_in_candidate(call: CallSession, pcm8k: bytes) -> None:
         call.playback_task.cancel()
 
 
-async def call_stt_from_pcm8k(pcm8k: bytes, language_hint: str, source: str = "turn") -> str:
-    """Transcribe PCM audio using STT service. Output: transcript text. Input: pcm and language."""
+async def call_stt_from_pcm8k(pcm8k: bytes, language_hint: str | None, source: str = "turn") -> str:
+    """Transcribe PCM audio using STT service. Output: transcript text. Input: pcm and optional language hint."""
     if not pcm8k:
         return ""
     pcm16k, _ = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, None)
@@ -558,41 +570,63 @@ async def call_stt_from_pcm8k(pcm8k: bytes, language_hint: str, source: str = "t
         return transcript
 
 
-async def call_llm(messages: list[dict[str, Any]]) -> str:
-    """Generate assistant response from LLM endpoint. Output: text. Input: OpenAI-style messages."""
+_SENTENCE_END_RE = re.compile(r"[.!?\n]")
+
+
+def _split_on_sentence_boundary(buffer: str) -> tuple[list[str], str]:
+    """Extract complete sentences from a text buffer. Output: (sentences, remainder). Input: accumulated LLM text."""
+    sentences: list[str] = []
+    while True:
+        m = _SENTENCE_END_RE.search(buffer)
+        if not m:
+            break
+        sentence = buffer[: m.end()].strip()
+        if sentence:
+            sentences.append(sentence)
+        buffer = buffer[m.end() :].lstrip()
+    return sentences, buffer
+
+
+async def stream_llm_chunks(messages: list[dict[str, Any]]):
+    """Stream LLM response as raw text chunks via OpenAI-compatible SSE. Output: async generator of str. Input: messages."""
     if not LLM_BASE_URL or not LLM_MODEL:
-        return "LLM provider is not configured."
+        yield "LLM provider is not configured."
+        return
 
     url = f"{LLM_BASE_URL}/v1/chat/completions"
     request_body = {
         "model": LLM_MODEL,
         "messages": messages,
-        "stream": False,
+        "stream": True,
     }
+    append_system_log("sip", "llm_start", "LLM stream started.", {"model": LLM_MODEL, "messages": len(messages)})
 
-    append_system_log(
-        "sip",
-        "llm_start",
-        "LLM request started.",
-        {"model": LLM_MODEL, "messages": len(messages)},
-    )
-
+    full_text = ""
     timeout = httpx.Timeout(LLM_TIMEOUT_SEC, connect=5.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, json=request_body)
-        response.raise_for_status()
-        body = response.json()
-        try:
-            answer = body["choices"][0]["message"]["content"].strip()
-            append_system_log(
-                "sip",
-                "llm_stop",
-                "LLM request finished.",
-                {"model": LLM_MODEL, "text": answer},
-            )
-            return answer
-        except Exception:
-            return "Не удалось получить ответ модели."
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream("POST", url, json=request_body) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    line = line.strip()
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(data)
+                        content = chunk["choices"][0]["delta"].get("content") or ""
+                        if content:
+                            full_text += content
+                            yield content
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+        append_system_log("sip", "llm_stop", "LLM stream finished.", {"model": LLM_MODEL, "text": full_text})
+    except Exception:
+        logger.exception("LLM stream failed for model %s", LLM_MODEL)
+        if not full_text:
+            yield "Извините, не удалось обработать запрос."
 
 
 async def call_tts(text: str, language: str) -> list[bytes]:
@@ -691,9 +725,9 @@ async def speak_text(call: CallSession, text: str, interrupted_mark_target: dict
 
 
 async def process_utterance(call: CallSession, utterance_pcm8k: bytes) -> None:
-    """Run one STT->LLM->TTS turn. Output: none. Input: utterance PCM bytes."""
+    """Run one STT->LLM->TTS turn; TTS starts on first complete sentence. Output: none. Input: utterance PCM bytes."""
     try:
-        transcript = await call_stt_from_pcm8k(utterance_pcm8k, call.language, source="turn")
+        transcript = await call_stt_from_pcm8k(utterance_pcm8k, None, source="turn")
     except Exception:
         logger.exception("STT failed for call %s", call.channel_id)
         return
@@ -708,23 +742,77 @@ async def process_utterance(call: CallSession, utterance_pcm8k: bytes) -> None:
         messages.append({"role": "system", "content": call.role_prompt})
     messages.extend(call.history)
 
-    try:
-        answer = await call_llm(messages)
-    except Exception:
-        logger.exception("LLM failed for call %s", call.channel_id)
-        answer = "Извините, не удалось обработать запрос."
+    # Pipeline: LLM stream → sentence split → TTS synthesis → RTP playback.
+    # TTS for the first sentence starts as soon as the first sentence boundary arrives.
+    tts_wav_queue: asyncio.Queue[list[bytes] | None] = asyncio.Queue()
+    all_sentences: list[str] = []
 
-    assistant_item: dict[str, Any] = {"role": "assistant", "content": answer, "interrupted": False}
-    call.history.append(assistant_item)
+    async def _llm_to_tts_producer() -> None:
+        """Stream LLM, split into sentences, synthesize TTS, enqueue WAV segments."""
+        buffer = ""
+        try:
+            async for chunk in stream_llm_chunks(messages):
+                if call.stop_event.is_set() or call.interrupted_event.is_set():
+                    break
+                buffer += chunk
+                sentences, buffer = _split_on_sentence_boundary(buffer)
+                for sentence in sentences:
+                    if call.stop_event.is_set() or call.interrupted_event.is_set():
+                        break
+                    all_sentences.append(sentence)
+                    try:
+                        wavs = await call_tts(sentence, call.language)
+                    except Exception:
+                        logger.exception("TTS failed for sentence in call %s", call.channel_id)
+                        wavs = []
+                    if wavs:
+                        tts_wav_queue.put_nowait(wavs)
+            # flush any text remaining after the last boundary
+            remainder = buffer.strip()
+            if remainder and not call.stop_event.is_set() and not call.interrupted_event.is_set():
+                all_sentences.append(remainder)
+                try:
+                    wavs = await call_tts(remainder, call.language)
+                except Exception:
+                    logger.exception("TTS flush failed in call %s", call.channel_id)
+                    wavs = []
+                if wavs:
+                    tts_wav_queue.put_nowait(wavs)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            tts_wav_queue.put_nowait(None)
 
-    playback_task = asyncio.create_task(speak_text(call, answer, assistant_item))
+    async def _streaming_playback() -> None:
+        """Drain TTS WAV queue and play segments; cancel producer on finish/interrupt."""
+        producer_task = asyncio.create_task(_llm_to_tts_producer())
+        try:
+            while True:
+                wavs = await tts_wav_queue.get()
+                if wavs is None:
+                    break
+                if call.stop_event.is_set() or call.interrupted_event.is_set():
+                    break
+                seg_interrupted = await play_wav_segments(call, wavs)
+                if seg_interrupted:
+                    break
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+
+    playback_task = asyncio.create_task(_streaming_playback())
     call.playback_task = playback_task
+    interrupted = False
     try:
         await playback_task
     except asyncio.CancelledError:
-        assistant_item["interrupted"] = True
+        interrupted = True
     finally:
         call.playback_task = None
+
+    answer = " ".join(all_sentences)
+    assistant_item: dict[str, Any] = {"role": "assistant", "content": answer, "interrupted": interrupted}
+    call.history.append(assistant_item)
 
 
 async def call_pipeline_loop(call: CallSession) -> None:
@@ -1024,3 +1112,46 @@ async def on_shutdown() -> None:
             await stop_call_session(channel_id)
         except Exception:
             logger.exception("Failed to stop call during shutdown: %s", channel_id)
+
+
+@app.post("/sip/call/hangup")
+async def sip_call_hangup(req: SipHangupRequest) -> dict[str, Any]:
+    """Hang up an active SIP call. Output: status dict. Input: channel_id."""
+    call = active_calls.get(req.channel_id)
+    if not call:
+        return {"status": "not_found", "channel_id": req.channel_id}
+    await stop_call_session(req.channel_id)
+    append_system_log("sip", "tool_hangup", "Call hung up via tool.", {"channel_id": req.channel_id})
+    return {"status": "ok", "channel_id": req.channel_id, "action": "hangup"}
+
+
+@app.post("/sip/call/transfer")
+async def sip_call_transfer(req: SipTransferRequest) -> dict[str, Any]:
+    """Blind transfer an active SIP call to a target extension. Output: status dict. Input: channel_id and target."""
+    call = active_calls.get(req.channel_id)
+    if not call:
+        return {"status": "not_found", "channel_id": req.channel_id}
+
+    redirect_url = f"{ASTERISK_HTTP_URL}/channels/{req.channel_id}/redirect"
+    params = {
+        "endpoint": f"PJSIP/{req.target}",
+        "extension": req.target,
+        "context": "colloc-inbound",
+        "priority": "1",
+    }
+    try:
+        async with httpx.AsyncClient(
+            auth=(ASTERISK_ARI_USER, ASTERISK_ARI_PASSWORD), timeout=8.0
+        ) as client:
+            resp = await client.post(redirect_url, params=params)
+            resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return {"status": "error", "channel_id": req.channel_id, "detail": f"ARI error {exc.response.status_code}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "channel_id": req.channel_id, "detail": str(exc)}
+
+    append_system_log(
+        "sip", "tool_transfer", "Call transferred via tool.",
+        {"channel_id": req.channel_id, "target": req.target},
+    )
+    return {"status": "ok", "channel_id": req.channel_id, "action": "transfer", "target": req.target}

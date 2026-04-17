@@ -1,0 +1,19 @@
+[Unit]
+Description=Colloc System Services
+Documentation=file:///home/denis/colloc/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=denis
+Group=docker
+WorkingDirectory=/home/denis/colloc
+ExecStart=/home/denis/colloc/colloc_service.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

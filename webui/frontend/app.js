@@ -36,6 +36,8 @@ const chatLogNode = document.getElementById("chat-log");
 const chatScrollNode = document.getElementById("chat-scroll");
 const systemLogNode = document.getElementById("system-log");
 const systemLogScrollNode = document.getElementById("system-log-scroll");
+const systemLogAutoscrollToggle = document.getElementById("system-log-autoscroll-toggle");
+const systemLogUpdateToggle = document.getElementById("system-log-update-toggle");
 const systemLogPollIntervalInput = document.getElementById("system-log-poll-interval");
 const systemLogPollIntervalValueNode = document.getElementById("system-log-poll-interval-value");
 const autoscrollToggle = document.getElementById("autoscroll-toggle");
@@ -525,7 +527,7 @@ function setSystemLog(lines) {
     return;
   }
   systemLogNode.textContent = lines && lines.length > 0 ? lines.join("\n") : "No system log yet.";
-  if (systemLogScrollNode) {
+  if (systemLogScrollNode && (!systemLogAutoscrollToggle || systemLogAutoscrollToggle.checked)) {
     systemLogScrollNode.scrollTop = systemLogScrollNode.scrollHeight;
   }
 }
@@ -536,7 +538,7 @@ function appendSystemLogLine(line) {
     return;
   }
   systemLogNode.textContent = `${systemLogNode.textContent}\n${line}`.trim();
-  if (systemLogScrollNode) {
+  if (systemLogScrollNode && (!systemLogAutoscrollToggle || systemLogAutoscrollToggle.checked)) {
     systemLogScrollNode.scrollTop = systemLogScrollNode.scrollHeight;
   }
 }
@@ -1141,12 +1143,12 @@ function syncControlButtons() {
   }
 }
 
-// Request backend-triggered full system reset. Output: none. Input: none.
+// Request backend-triggered system restart. Output: none. Input: none.
 async function resetSystem() {
   if (!resetSystemButton) {
     return;
   }
-  const confirmed = window.confirm("This will trigger full system restart. Continue?");
+  const confirmed = window.confirm("This will restart all system services. Continue?");
   if (!confirmed) {
     return;
   }
@@ -1162,9 +1164,9 @@ async function resetSystem() {
     if (!response.ok) {
       throw new Error(payload.message || `HTTP ${response.status}`);
     }
-    appendEvent(`System reset requested: ${payload.message || "accepted"}.`);
+    appendEvent(`System restart requested: ${payload.message || "accepted"}.`);
   } catch (err) {
-    appendEvent(`System reset failed: ${err.message || err}`);
+    appendEvent(`System restart failed: ${err.message || err}`);
   } finally {
     resetSystemButton.disabled = false;
   }
@@ -1521,6 +1523,9 @@ function connectSession() {
 
 // Connect dedicated websocket stream for system log panel. Output: none. Input: none.
 async function fetchSystemLogSnapshot() {
+  if (systemLogUpdateToggle && !systemLogUpdateToggle.checked) {
+    return;
+  }
   if (systemLogPollingInFlight) {
     return;
   }
@@ -1893,6 +1898,13 @@ if (systemLogPollIntervalInput) {
   systemLogPollIntervalInput.addEventListener("input", () => {
     renderSystemLogPollInterval();
     scheduleSystemLogPoll();
+  });
+}
+if (systemLogUpdateToggle) {
+  systemLogUpdateToggle.addEventListener("change", () => {
+    if (systemLogUpdateToggle.checked) {
+      fetchSystemLogSnapshot();
+    }
   });
 }
 if (temperatureInput) {
