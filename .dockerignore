@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+memory/
+data/
+logs/
+tmp/
+temp/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

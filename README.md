@@ -36,23 +36,36 @@ Compose profiles:
 - `sip`: Asterisk
 - `telegram`: Telegram bot
 
+## Related Documentation
+
+- [SPEC.md](SPEC.md) — Project specification and design
+- [AGENTS.md](AGENTS.md) — Agent workflow and development rules
+
 ## Recent Changes
 
-- Added Silero provider support in TTS routing with shared-container addressing and provider fallback.
-- Improved LLM -> TTS live streaming: chunks are dispatched not only on sentence punctuation, but also by soft length threshold for better real-time playback.
-- Added interruption semantics: new LLM answer start clears pending playback queue and interrupts current TTS playback.
+- Added secure system restart service (`colloc_service.sh`, `colloc.service`) with webhook-based restart hook (no Docker socket mounting).
+- Renamed "Reset system" button to "Restart system" for clarity.
+- Added `Stop services` / `Start services` buttons in Web UI to temporarily stop non-core services and restore them.
+- Added README section for system service setup and troubleshooting.
+- Silero TTS provider with per-language routing and provider fallback.
+- LLM -> TTS live streaming: chunks dispatched by soft length threshold for better real-time playback.
+- Interruption semantics: new LLM answer clears pending playback queue.
 
 ## Repository Layout
 
 - `docker-compose.yml`: main stack
 - `docker-compose.override.yml`: local development overrides with hot reload for FastAPI services
 - `docker-compose.publish.yml`: optional publication of STT/TTS service ports
+- `install.sh`: setup script for project-local directories and systemd service generation
+- `colloc_service.sh`: auxiliary system service entry point (manages host-side services)
+- `colloc.service`: generated systemd unit (created by `install.sh`, can be installed system-wide)
 - `gateway/`: Nginx templates and startup script
 - `webui/frontend/`: static frontend
 - `webui/backend/`: FastAPI backend
 - `services/stt/`: STT FastAPI service
 - `services/tts_router/`: TTS routing FastAPI service
 - `services/tools/`: tools FastAPI service
+- `scripts/restart-service-hook.py`: HTTP hook listener for container-triggered system restarts
 - `asterisk/`: Asterisk image and config
 
 ## Installation and Startup
@@ -64,13 +77,16 @@ Use this section for a clean setup on a new host or new clone.
 1. Clone repository and enter directory:
 
 ```bash
+# run command
 git clone <your-repo-url> colloc
+# change directory
 cd colloc
 ```
 
 2. Create local environment file:
 
 ```bash
+# copy file
 cp .env.example .env
 ```
 
@@ -79,30 +95,142 @@ cp .env.example .env
 4. Prepare all project-local runtime directories and permissions:
 
 ```bash
+# make script executable
 chmod +x install.sh
+# run command
 ./install.sh
 ```
 
-This step creates required folders in the workspace and ensures writable runtime paths for model preload under `./data`.
+This step creates required folders in the workspace and ensures writable runtime paths for model preload under `./data`. It also generates `colloc.service` systemd unit file and attempts automatic installation.
+
+### 4.1 System Service Installation (for automatic Restart button)
+
+The `Restart system` button in the Web UI requires a listener service on the host to restart Docker Compose services.
+
+**How it works:**
+
+The `./install.sh` script will:
+1. Generate `colloc.service` systemd unit file (automatically)
+2. Attempt to create `/etc/sudoers.d/colloc-system-service` for passwordless sudo (if possible)
+3. Attempt to install the service system-wide (if passwordless sudo is available)
+
+**Option 1: Let install.sh handle it (Recommended)**
+
+Just run:
+
+```bash
+# run command
+./install.sh
+```
+
+If you have passwordless sudo configured, the service will be installed automatically. If not, you'll see instructions to enable it.
+
+**Option 2: Manual Installation**
+
+If automatic installation doesn't work or you prefer manual setup:
+
+```bash
+# 1. Create sudoers entry (copy the one printed by install.sh, or use this template):
+# run command with sudo
+sudo tee /etc/sudoers.d/colloc-system-service > /dev/null << 'EOF'
+# Colloc system service: allow passwordless systemd operations
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/cp /path/to/colloc/colloc.service /etc/systemd/system/
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl daemon-reload
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl enable colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl start colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl restart colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl stop colloc.service
+YOUR_USERNAME ALL = (ALL) NOPASSWD: /bin/systemctl status colloc.service
+EOF
+
+# 2. Install the service:
+# run command with sudo
+sudo cp colloc.service /etc/systemd/system/
+# run command with sudo
+sudo systemctl daemon-reload
+# run command with sudo
+sudo systemctl enable colloc.service
+# run command with sudo
+sudo systemctl start colloc.service
+```
+
+**Verify Installation:**
+
+```bash
+# run command with sudo
+sudo systemctl status colloc.service
+# run command with sudo
+sudo journalctl -u colloc.service -f
+```
+
+**Note:** The "Restart system" button is optional. The Docker stack works fine without this service. If the service is not installed, clicking the button will show a connection error (expected).
+
+### 4.2 Web UI Service Control Buttons (Stop/Start)
+
+The Web UI has two additional control buttons:
+
+- `Stop services`: stops running services except a protected keep-list.
+- `Start services`: starts back services that were stopped by the previous action.
+
+Default keep-list:
+
+- `gateway`
+- `webui-backend`
+- `redis`
+
+The host hook persists the stopped service set to:
+
+- `logs/service-control-state.json`
+
+Environment variables:
+
+- `SYSTEM_SERVICE_CONTROL_KEEP_SERVICES`: comma-separated service names to keep running.
+- `SYSTEM_RESET_HOOK_BIND_HOST`: host bind address for restart hook (`0.0.0.0` recommended).
+- `SYSTEM_STOP_SERVICES_COMMAND`: command used only in `SYSTEM_RESET_MODE=command` for stop action.
+- `SYSTEM_START_SERVICES_COMMAND`: command used only in `SYSTEM_RESET_MODE=command` for start action.
+
+Examples for `SYSTEM_RESET_MODE=command`:
+
+```bash
+# run command
+SYSTEM_STOP_SERVICES_COMMAND="docker compose stop stt tts-router tools silero kokoro piper-en piper-ru sip-service sip-ari asterisk"
+# run command
+SYSTEM_START_SERVICES_COMMAND="docker compose up -d stt tts-router tools silero kokoro piper-en piper-ru sip-service sip-ari asterisk"
+```
+
+If you use `SYSTEM_RESET_MODE=hook`, these command variables may stay empty.
+
+After changing these variables, restart host service:
+
+```bash
+# run command with sudo
+sudo systemctl restart colloc.service
+```
 
 5. Build and start full stack (core + TTS + SIP):
 
 ```bash
+# run Docker command
 docker compose --profile core --profile tts --profile sip up -d --build
 ```
 
 6. Verify health:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile tts --profile sip ps
+# send HTTP request
 curl -fsS http://127.0.0.1:6080/healthz
+# send HTTP request
 curl -fsS http://127.0.0.1:6080/api/health
 ```
 
 7. If `AUTOLOAD=true`, verify preload:
 
 ```bash
+# send HTTP request
 curl -s -X POST http://127.0.0.1:6080/api/autoload-preload
+# show log tail
 tail -n 80 logs/system.log | sed -n '/autoload\./p'
 ```
 
@@ -117,7 +245,9 @@ If you see permission-related preload errors in `logs/system.log`, run `./instal
 Check tools:
 
 ```bash
+# run Docker command
 docker --version
+# run Docker command
 docker compose version
 ```
 
@@ -134,6 +264,7 @@ The project follows the SPEC rule: no host system modifications are required for
 Create your local environment file:
 
 ```bash
+# copy file
 cp .env.example .env
 ```
 
@@ -150,21 +281,27 @@ Then edit `.env` and set at least:
 If you run in a local LAN and cannot use a public domain, generate a self-signed certificate for your LAN IP (or local DNS name):
 
 ```bash
+# create directories
 mkdir -p certs
+# make script executable
 chmod +x scripts/generate-self-signed-cert.sh
+# run command
 ./scripts/generate-self-signed-cert.sh 192.168.1.50 ./certs
 ```
 
 Update `.env`:
 
 ```bash
+# run command
 DOMAIN=192.168.1.50
+# run command
 EXTERNAL_CERTIFICATE=./certs
 ```
 
 Restart gateway:
 
 ```bash
+# run Docker command
 docker compose --profile core up -d gateway
 ```
 
@@ -184,13 +321,16 @@ Note:
 ### 3. Prepare Local Directories
 
 ```bash
+# create directories
 mkdir -p data config logs
+# create directories
 mkdir -p data/redis data/asterisk logs/asterisk
 ```
 
 ### 4. Build Images
 
 ```bash
+# run Docker command
 docker compose build
 ```
 
@@ -199,18 +339,21 @@ docker compose build
 Core stack:
 
 ```bash
+# run Docker command
 docker compose --profile core up -d
 ```
 
 Core + SIP + Telegram:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip --profile telegram up -d
 ```
 
 Development mode with hot reload:
 
 ```bash
+# run Docker command
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.override.yml \
@@ -220,6 +363,7 @@ docker compose \
 Publish STT/TTS ports externally (optional):
 
 ```bash
+# run Docker command
 docker compose \
   -f docker-compose.yml \
   -f docker-compose.publish.yml \
@@ -250,18 +394,23 @@ The status payload contains:
 
 ```bash
 # Start
+# run Docker command
 docker compose --profile core up -d
 
 # Stop
+# run Docker command
 docker compose --profile core stop
 
 # Restart (keeps containers and data)
+# run Docker command
 docker compose --profile core restart
 
 # Full restart (remove containers/networks and bring back up)
+# run Docker command
 docker compose --profile core down && docker compose --profile core up -d
 
 # Remove containers/networks
+# run Docker command
 docker compose --profile core down
 ```
 
@@ -269,18 +418,27 @@ docker compose --profile core down
 
 ```bash
 # All services
+# run Docker command
 docker compose --profile core logs -f --tail=200
 
 # Single services
+# run Docker command
 docker compose logs -f gateway
+# run Docker command
 docker compose logs -f webui-backend
+# run Docker command
 docker compose logs -f stt
+# run Docker command
 docker compose logs -f tts-router
+# run Docker command
 docker compose logs -f tools
+# run Docker command
 docker compose logs -f redis
 
 # Optional profiles
+# run Docker command
 docker compose --profile core --profile sip logs -f asterisk
+# run Docker command
 docker compose --profile telegram logs -f telegram-bot
 ```
 
@@ -288,9 +446,11 @@ docker compose --profile telegram logs -f telegram-bot
 
 ```bash
 # Running containers
+# run Docker command
 docker compose ps
 
 # Render full merged config
+# run Docker command
 docker compose config
 ```
 
@@ -301,7 +461,9 @@ Assuming default `.env` values (`NGINX_HTTP_PORT=6080`, `NGINX_HTTPS_PORT=6443`)
 Base URLs:
 
 ```bash
+# run command
 BASE_URL_HTTP=http://127.0.0.1:6080
+# run command
 BASE_URL_HTTPS=https://127.0.0.1:6443
 ```
 
@@ -310,22 +472,28 @@ HTTP and HTTPS are both available for local access. Use HTTPS when you explicitl
 ### Gateway
 
 ```bash
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/healthz"
 ```
 
 ### Web UI backend
 
 ```bash
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/health"
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/runtime" | jq .
 ```
 
 ### STT service
 
 ```bash
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/stt/health"
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/stt/providers" | jq .
 
+# send HTTP request
 curl -fsS -X POST "$BASE_URL_HTTP/api/stt/transcribe" \
   -H "Content-Type: application/json" \
   -d '{"audio_url":"https://example.com/audio.wav","language_hint":"en","partial":false}' | jq .
@@ -334,14 +502,18 @@ curl -fsS -X POST "$BASE_URL_HTTP/api/stt/transcribe" \
 ### TTS router
 
 ```bash
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/tts/health"
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/tts/voices" | jq .
 
+# send HTTP request
 curl -fsS -X POST "$BASE_URL_HTTP/api/tts/synthesize" \
   -H "Content-Type: application/json" \
   -d '{"text":"И Иван сказал: I need an apple"}' | jq .
 
 # Russian-only test (useful for validating Silero route if configured as RU primary):
+# send HTTP request
 curl -fsS -X POST "$BASE_URL_HTTP/api/tts/synthesize" \
   -H "Content-Type: application/json" \
   -d '{"text":"Проверка связи прошла успешно: сигнал чистый, помех нет, я на связи и готов к работе."}' \
@@ -351,9 +523,12 @@ curl -fsS -X POST "$BASE_URL_HTTP/api/tts/synthesize" \
 ### Tools service
 
 ```bash
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/tools/health"
+# send HTTP request
 curl -fsS "$BASE_URL_HTTP/api/tools/tools" | jq .
 
+# send HTTP request
 curl -fsS -X POST "$BASE_URL_HTTP/api/tools/invoke" \
   -H "Content-Type: application/json" \
   -d '{"tool":"web_search","payload":{"query":"weather in Berlin"}}' | jq .
@@ -363,35 +538,69 @@ curl -fsS -X POST "$BASE_URL_HTTP/api/tools/invoke" \
 
 ```bash
 # Without password
+# run Docker command
 docker compose exec redis redis-cli ping
 
 # With password
+# run Docker command
 docker compose exec redis sh -lc 'redis-cli -a "$REDIS_PASSWORD" ping'
 ```
 
 ### Piper, Kokoro and Silero (container-level checks)
 
 ```bash
+# run Docker command
 docker compose exec piper-en sh -lc 'curl -fsS "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/health"'
+# run Docker command
 docker compose exec piper-ru sh -lc 'curl -fsS "http://127.0.0.1:${TTS_RU_PRIMARY_PORT:-6011}/health"'
+# run Docker command
 docker compose exec kokoro sh -lc 'curl -fsS "http://127.0.0.1:${KOKORO_PORT:-6030}/health"'
+# run Docker command
 docker compose exec silero sh -lc 'curl -fsS "http://127.0.0.1:${SILERO_PORT:-6040}/health"'
 
+# run Docker command
 docker compose exec piper-en sh -lc 'curl -fsS -X POST "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Hello from Piper EN\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
+# run Docker command
 docker compose exec kokoro sh -lc 'curl -fsS -X POST "http://127.0.0.1:${KOKORO_PORT:-6030}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Hello from Kokoro\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
+# run Docker command
 docker compose exec silero sh -lc 'curl -fsS -X POST "http://127.0.0.1:${SILERO_PORT:-6040}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"Проверка синтеза Silero\",\"language\":\"ru\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### Asterisk
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip ps asterisk
+# run Docker command
 docker compose --profile core --profile sip exec asterisk asterisk -rx 'core show uptime'
+# run Docker command
 docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
 
 # Realtime Asterisk logs (tail + follow)
+# run Docker command
 docker compose --profile core --profile sip logs -f --tail=200 asterisk
+
+#reload pjsip. can use "core reload", "dialplan reload" ...
+# run Docker command
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip reload'
+
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'dialplan reload'
+
+#console
+docker compose --profile core --profile sip exec -it asterisk asterisk -r
+
 ```
+console commands:
+```
+pjsip reload
+dialplan reload
+dialplan show
+dialplan show zadarma-in
+pjsip list endpoints
+pjsip show endpoints
+```
+
+
 
 ## Per-Service Test Requests
 
@@ -400,25 +609,30 @@ This section provides one compact smoke-check request per service.
 Before running checks, start all required profiles:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile tts --profile sip up -d
 ```
 
 ### 1. gateway
 
 ```bash
+# send HTTP request
 curl -fsS "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/healthz"
 ```
 
 ### 2. webui-backend
 
 ```bash
+# send HTTP request
 curl -fsS "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/health"
 ```
 
 ### 3. stt
 
 ```bash
+# send HTTP request
 curl -fsS "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/stt/health"
+# send HTTP request
 curl -fsS -X POST "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/stt/transcribe" \
   -H "Content-Type: application/json" \
   -d '{"audio_url":"https://example.com/a.wav","language_hint":"en","partial":true}'
@@ -427,7 +641,9 @@ curl -fsS -X POST "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/stt/transcribe"
 ### 4. tts-router
 
 ```bash
+# send HTTP request
 curl -fsS "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/tts/health"
+# send HTTP request
 curl -fsS -X POST "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/tts/synthesize" \
   -H "Content-Type: application/json" \
   -d '{"text":"Привет, I need two apples"}'
@@ -436,7 +652,9 @@ curl -fsS -X POST "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/tts/synthesize"
 ### 5. tools
 
 ```bash
+# send HTTP request
 curl -fsS "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/tools/health"
+# send HTTP request
 curl -fsS -X POST "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/tools/invoke" \
   -H "Content-Type: application/json" \
   -d '{"tool":"web_search","payload":{"query":"docker compose healthcheck"}}'
@@ -445,55 +663,70 @@ curl -fsS -X POST "http://127.0.0.1:${NGINX_HTTP_PORT:-6080}/api/tools/invoke" \
 ### 6. redis
 
 ```bash
+# run Docker command
 docker compose exec redis redis-cli ping
 ```
 
 ### 7. piper-en
 
 ```bash
+# run Docker command
 docker compose exec piper-en sh -lc 'curl -fsS "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/health"'
+# run Docker command
 docker compose exec piper-en sh -lc 'curl -fsS -X POST "http://127.0.0.1:${TTS_EN_PRIMARY_PORT:-6010}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"hello\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### 8. piper-ru
 
 ```bash
+# run Docker command
 docker compose exec piper-ru sh -lc 'curl -fsS "http://127.0.0.1:${TTS_RU_PRIMARY_PORT:-6011}/health"'
+# run Docker command
 docker compose exec piper-ru sh -lc 'curl -fsS -X POST "http://127.0.0.1:${TTS_RU_PRIMARY_PORT:-6011}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"привет\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### 9. kokoro
 
 ```bash
+# run Docker command
 docker compose exec kokoro sh -lc 'curl -fsS "http://127.0.0.1:${KOKORO_PORT:-6030}/health"'
+# run Docker command
 docker compose exec kokoro sh -lc 'curl -fsS -X POST "http://127.0.0.1:${KOKORO_PORT:-6030}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"hello\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### 10. silero
 
 ```bash
+# run Docker command
 docker compose exec silero sh -lc 'curl -fsS "http://127.0.0.1:${SILERO_PORT:-6040}/health"'
+# run Docker command
 docker compose exec silero sh -lc 'curl -fsS -X POST "http://127.0.0.1:${SILERO_PORT:-6040}/synthesize" -H "Content-Type: application/json" -d "{\"text\":\"проверка синтеза\",\"language\":\"ru\"}" | python -c "import sys,json; d=json.load(sys.stdin); print(d.get(\"provider\"), len(d.get(\"audio_b64\",\"\")))"'
 ```
 
 ### 11. sip-service
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip exec sip-service curl -fsS http://127.0.0.1:8004/health
+# run Docker command
 docker compose --profile core --profile sip logs sip-service
 ```
 
 ### 12. asterisk
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip exec asterisk asterisk -rx 'core show uptime'
+# run Docker command
 docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
 ```
 
 ### 13. telegram-bot
 
 ```bash
+# run Docker command
 docker compose --profile telegram ps telegram-bot
+# run Docker command
 docker compose --profile telegram logs --tail=50 telegram-bot
 ```
 
@@ -502,15 +735,20 @@ docker compose --profile telegram logs --tail=50 telegram-bot
 Run config validation before deployment:
 
 ```bash
+# run Docker command
 docker compose -f docker-compose.yml config
+# run Docker command
 docker compose -f docker-compose.yml -f docker-compose.override.yml config
+# run Docker command
 docker compose -f docker-compose.yml -f docker-compose.publish.yml config
 ```
 
 Build validation:
 
 ```bash
+# run Docker command
 docker build -t colloc-base:dev .
+# run Docker command
 docker build -t colloc-asterisk:dev ./asterisk
 ```
 
@@ -521,6 +759,7 @@ The primary LLM pipeline runs over WebSocket at `ws://HOST:6080/ws`.
 ### Verify LLM is configured
 
 ```bash
+# send HTTP request
 curl -s http://127.0.0.1:6080/api/runtime | \
   python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('llm_provider_primary_base_url'), d.get('llm_provider_primary_model'))"
 ```
@@ -536,47 +775,78 @@ Uses Python environment from `webui-backend` container. No host package installa
 **Text query:**
 
 ```bash
+# run Docker command
 docker compose exec -T webui-backend python - <<'PYEOF'
 import asyncio, json, websockets
 
+# run command
 async def main():
+# run command
     async with websockets.connect("ws://127.0.0.1:6080/ws") as ws:
+# run command
         print(await ws.recv())  # session.ready
+# run command
         await ws.send(json.dumps({"type": "text.query", "text": "What is the capital of France?"}))
+# run command
         while True:
+# run command
             msg = json.loads(await ws.recv())
+# run command
             if msg["type"] == "llm.token":
+# run command
                 print(msg["token"], end="", flush=True)
+# run command
             elif msg["type"] in ("llm.done", "error"):
+# run command
                 print()
+# run command
                 print(json.dumps(msg, ensure_ascii=False))
+# run command
                 break
 
+# run command
 asyncio.run(main())
+# run command
 PYEOF
 ```
 
 **Text query with system prompt:**
 
 ```bash
+# run Docker command
 docker compose exec -T webui-backend python - <<'PYEOF'
 import asyncio, json, websockets
 
+# run command
 async def main():
+# run command
     async with websockets.connect("ws://127.0.0.1:6080/ws") as ws:
+# run command
         await ws.recv()  # session.ready
+# run command
         await ws.send(json.dumps({"type": "session.config", "role": "translator",
+# run command
                                   "system_prompt": "Translate all messages to Russian."}))
+# run command
         await ws.recv()  # session.config.ack
+# run command
         await ws.send(json.dumps({"type": "text.query", "text": "Good morning, how are you?"}))
+# run command
         while True:
+# run command
             msg = json.loads(await ws.recv())
+# run command
             if msg["type"] == "llm.token":
+# run command
                 print(msg["token"], end="", flush=True)
+# run command
             elif msg["type"] in ("llm.done", "error"):
+# run command
                 print(); break
 
+# run command
 asyncio.run(main())
+# run command
 PYEOF
 ```
 
@@ -592,6 +862,7 @@ If `websocat` is already available, use the commands below. To keep host unchang
 **Text query:**
 
 ```bash
+# print JSON payload
 echo '{"type":"text.query","text":"What is the capital of France?"}' \
   | websocat -n "ws://127.0.0.1:6080/ws"
 ```
@@ -599,6 +870,7 @@ echo '{"type":"text.query","text":"What is the capital of France?"}' \
 **Text query with session config:**
 
 ```bash
+# print JSON lines for websocat
 printf '%s\n%s\n' \
   '{"type":"session.config","role":"translator","system_prompt":"Translate to Russian."}' \
   '{"type":"text.query","text":"Good morning!"}' \
@@ -608,6 +880,7 @@ printf '%s\n%s\n' \
 **Interactive multi-turn dialog:**
 
 ```bash
+# open WebSocket client
 websocat "ws://127.0.0.1:6080/ws"
 # Type JSON messages manually, one per line:
 # {"type":"text.query","text":"Hello, tell me a joke."}
@@ -623,6 +896,7 @@ Use these commands to check the primary Ollama instance directly, without going 
 **Step 1 — TCP reachability:**
 
 ```bash
+# send HTTP request
 curl -sv --max-time 5 http://192.168.1.110:11434/api/tags
 ```
 
@@ -632,6 +906,7 @@ Expected: HTTP 200 with JSON list of models.
 **Step 2 — List loaded models:**
 
 ```bash
+# send HTTP request
 curl -s http://192.168.1.110:11434/api/tags | python3 -c \
   "import sys,json; [print(m['name']) for m in json.load(sys.stdin).get('models',[])]"
 ```
@@ -642,6 +917,7 @@ If the model is missing, pull it first: `ollama pull <model>`.
 **Step 3 — Test generation via Ollama native API:**
 
 ```bash
+# send HTTP request
 curl -s http://192.168.1.110:11434/api/generate \
   -H "Content-Type: application/json" \
   -d '{"model":"juilpark/gemma-4-26B-A4B-it-heretic:q4_k_m","prompt":"What is the capital of France?","stream":false}' \
@@ -651,6 +927,7 @@ curl -s http://192.168.1.110:11434/api/generate \
 **Step 4 — Test via OpenAI-compatible endpoint (used by colloc):**
 
 ```bash
+# send HTTP request
 curl -s http://192.168.1.110:11434/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"juilpark/gemma-4-26B-A4B-it-heretic:q4_k_m","messages":[{"role":"user","content":"What is the capital of France?"}],"stream":false}' \
@@ -663,11 +940,14 @@ curl -s http://192.168.1.110:11434/v1/chat/completions \
 **Using values from `.env` directly:**
 
 ```bash
+# load environment variables
 source .env
 # Quick connectivity check
+# send HTTP request
 curl -sv --max-time 5 "${LLM_PROVIDER_PRIMARY_BASE_URL}/api/tags"
 
 # Full generation test (OpenAI-compatible)
+# send HTTP request
 curl -s "${LLM_PROVIDER_PRIMARY_BASE_URL}/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d "{\"model\":\"${LLM_PROVIDER_PRIMARY_MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello.\"}],\"stream\":false}" \
@@ -697,14 +977,23 @@ To enable SIP voice calls via Asterisk, set up environment and profile:
 
 ```bash
 # In .env:
+# run command
 SIP_ENABLED=true
+# run command
 SIP_SERVICE_PORT=8004
+# run command
 SIP_ROLE=ai_scripts/test.md              # Path to role/system prompt
+# run command
 SIP_GREETINGS=ai_scripts/greetings.md    # Greeting text or WAV file
+# run command
 SIP_MAX_SILENCE=30                        # Silence timeout (seconds)
+# run command
 SIP_MAX_DURATION=600                      # Call duration limit (seconds)
+# run command
 ASTERISK_PJSIP_PORT=6060                  # SIP listen port
+# run command
 ASTERISK_RTP_START=6700
+# run command
 ASTERISK_RTP_END=6800
 ```
 
@@ -712,8 +1001,72 @@ ASTERISK_RTP_END=6800
 
 ```bash
 # Start core services + SIP
+# run Docker command
 docker compose --profile core --profile tts --profile sip up -d
 ```
+
+### External NAT Port Forwarding (Important)
+
+If calls from LAN work but calls from the Internet drop (for example around 30-40 seconds), check NAT port forwarding and advertised SIP settings.
+
+Use this mapping model:
+
+- Public SIP port on router (WAN), example: `5060/udp`
+- Forwarded to host internal SIP port, example: `192.168.x.x:6060/udp`
+- RTP range forwarded one-to-one, example: `6700-6800/udp`
+
+What to set where:
+
+1. Docker/.env (internal listener ports)
+
+```bash
+# Internal SIP bind port used by Asterisk container
+ASTERISK_PJSIP_PORT=6060
+
+# Internal RTP range used by Asterisk container
+ASTERISK_RTP_START=6700
+ASTERISK_RTP_END=6800
+```
+
+2. Asterisk transport advertisement (`asterisk/etc/pjsip.conf`)
+
+For external transport, `bind` must stay internal, but `external_signaling_port` must match PUBLIC router port:
+
+```ini
+[transport-udp-external]
+type = transport
+protocol = udp
+bind = 0.0.0.0:6060
+external_signaling_address = your.public.domain.or.ip
+external_signaling_port = 5060
+external_media_address = your.public.domain.or.ip
+```
+
+Why this matters: if `external_signaling_port` is wrong (for example `6060` while WAN port is `5060`), remote clients may send in-dialog `ACK/BYE` to the wrong public port and calls can be dropped.
+
+3. Router/NAT
+
+- Forward `WAN:5060/udp` -> `LAN_HOST:6060/udp`
+- Forward `WAN:6700-6800/udp` -> `LAN_HOST:6700-6800/udp`
+- Disable SIP ALG on router if possible
+
+Apply and verify after changes:
+
+```bash
+# Reload PJSIP config
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip reload'
+
+# Reload dialplan (extentions.conf)
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'dialplan reload'
+
+# Check runtime transport values
+docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip show transport transport-udp-external'
+```
+
+Expected runtime state for the example above:
+
+- `bind : 0.0.0.0:6060`
+- `external_signaling_port : 5060`
 
 ### Role and Greeting Files
 
@@ -762,12 +1115,15 @@ Check SIP service and Asterisk:
 
 ```bash
 # SIP service health
+# run Docker command
 docker compose --profile core --profile sip exec sip-service curl -fsS http://127.0.0.1:8004/health
 
 # Asterisk uptime
+# run Docker command
 docker compose --profile core --profile sip exec asterisk asterisk -rx 'core show uptime'
 
 # Show configured PJSIP endpoints
+# run Docker command
 docker compose --profile core --profile sip exec asterisk asterisk -rx 'pjsip show endpoints'
 ```
 
@@ -783,20 +1139,26 @@ Use one of these options:
 
 ```bash
 # Soft restart (only Asterisk container)
+# run Docker command
 docker compose --profile core --profile sip restart asterisk
 
 # Recreate Asterisk and ARI listener (recommended after config changes)
+# run Docker command
 docker compose --profile core --profile sip up -d --force-recreate asterisk sip-ari
 
 # Full SIP stack restart
+# run Docker command
 docker compose --profile core --profile sip restart asterisk sip-service sip-ari
 ```
 
 After restart, verify:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip ps asterisk sip-ari sip-service
+# run Docker command
 docker compose --profile core --profile sip exec -T asterisk asterisk -rx 'core show uptime'
+# run Docker command
 docker compose --profile core --profile sip exec -T asterisk asterisk -rx 'pjsip show endpoints'
 ```
 
@@ -814,13 +1176,16 @@ Use a SIP softphone (Linphone, Zoiper, MicroSIP) from another device in the same
 1. Ensure services are running:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile tts --profile sip up -d
+# run Docker command
 docker compose --profile core --profile sip ps asterisk sip-service sip-ari
 ```
 
 2. Check Asterisk endpoint state:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip exec -T asterisk asterisk -rx 'pjsip show endpoints'
 ```
 
@@ -829,6 +1194,7 @@ You should see `colloc-endpoint` with transport `0.0.0.0:6060`.
 3. Find host LAN IP (on machine where Docker stack runs):
 
 ```bash
+# show host IP addresses
 hostname -I
 ```
 
@@ -850,6 +1216,7 @@ Use your LAN address (for example `192.168.1.100`).
 6. Watch runtime logs during call:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip logs -f asterisk sip-ari sip-service
 ```
 
@@ -862,8 +1229,11 @@ Expected call path:
 Example Linphone CLI sequence:
 
 ```bash
+# start Linphone CLI
 linphonec
+# run command
 register sip:colloc@192.168.1.100:6060 colloc change-me
+# run command
 call 100
 ```
 
@@ -874,6 +1244,7 @@ If registration/call fails:
 - re-check credentials in `asterisk/etc/pjsip.conf` and restart Asterisk:
 
 ```bash
+# run Docker command
 docker compose --profile core --profile sip up -d --force-recreate asterisk sip-ari
 ```
 
@@ -886,3 +1257,14 @@ This is the first operational scaffold, not a final production implementation.
 - Silero runs as a real server-side synthesis service and requires PyTorch in the runtime image
 - SIP flow is baseline-configured and requires telephony hardening for production
 - Security hardening beyond container defaults (secrets manager, firewall policies, IDS, SIEM) is out of scope for this first version
+
+
+Recreate containeds 
+```sh
+#webui-backend sip-service .....
+docker compose --profile core --profile sip up -d --build --force-recreate ....LIST... 
+
+#For SIP stuff
+docker compose --profile core --profile sip up -d --build --force-recreate sip-service sip-ari
+
+```

@@ -42,6 +42,17 @@ temp/
 .env.*
 !.env.example
 
+# Local runtime telephony configs (keep *.example in git)
+asterisk/etc/pjsip.conf
+asterisk/etc/ari.conf
+!asterisk/etc/ari.conf.example
+!asterisk/etc/pjsip.conf.example
+
+#Agents and spec
+memory/
+AGENTS.md
+SPEC.md
+
 # Runtime persistent data
 data/
 logs/
@@ -50,3 +61,7 @@ addons/custom/*
 
 #dont publish certificates
 certs/live/127.0.0.1/
+
+ai_scripts/spa.md
+ai_scripts/allthai_role.md
+ai_scripts/allthai_greetings.md

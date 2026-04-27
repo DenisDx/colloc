@@ -1,0 +1,158 @@
+[global]
+type = global
+user_agent = colloc-asterisk
+endpoint_identifier_order = auth_username,username,ip,anonymous
+
+[transport-udp-local]
+type = transport
+protocol = udp
+bind = 0.0.0.0:5060
+external_signaling_address = 192.0.2.10
+external_signaling_port = 5060
+external_media_address = 192.0.2.10
+local_net = 172.21.0.0/16
+
+[transport-udp-external]
+type = transport
+protocol = udp
+bind = 0.0.0.0:6060
+external_signaling_address = sip.example.invalid
+external_signaling_port = 5060
+external_media_address = sip.example.invalid
+local_net = 192.168.1.0/24
+local_net = 172.21.0.0/16
+
+[endpoint-local-common](!)
+type = endpoint
+transport = transport-udp-local
+context = from-internal
+disallow = all
+allow = ulaw,alaw,opus,g722
+identify_by = auth_username,username
+force_rport = yes
+rtp_symmetric = yes
+rewrite_contact = yes
+direct_media = no
+timers = no
+rtp_keepalive = 15
+
+[endpoint-external-common](!)
+type = endpoint
+transport = transport-udp-external
+context = from-external
+disallow = all
+allow = ulaw,alaw,opus,g722
+identify_by = ip,username
+force_rport = yes
+rtp_symmetric = yes
+rewrite_contact = yes
+direct_media = no
+timers = no
+rtp_keepalive = 15
+
+[aor-common](!)
+type = aor
+max_contacts = 1
+remove_existing = yes
+qualify_frequency = 30
+
+[auth-common](!)
+type = auth
+auth_type = userpass
+
+[colloc](endpoint-external-common)
+aors = colloc
+auth = colloc-auth
+from_user = colloc-demo
+acl = localnet-acl
+
+[colloc-auth](auth-common)
+username = colloc-demo
+password = DemoPass_ChangeMe_001
+
+[colloc](aor-common)
+
+[colloc-identify]
+type = identify
+endpoint = colloc
+match = 203.0.113.10
+
+[1001](endpoint-local-common)
+aors = 1001
+auth = 1001-auth
+acl = localnet-acl
+
+[1001-auth](auth-common)
+username = endpoint-1001-demo
+password = DemoPass_ChangeMe_1001
+
+[1001](aor-common)
+
+[1002](endpoint-external-common)
+context = from-internal
+identify_by = auth_username,username
+aors = 1002
+auth = 1002-auth
+
+[1002-auth](auth-common)
+username = endpoint-1002-demo
+password = DemoPass_ChangeMe_1002
+
+[1002](aor-common)
+qualify_frequency = 0
+
+[1003](endpoint-external-common)
+context = from-internal
+identify_by = auth_username,username
+aors = 1003
+auth = 1003-auth
+
+[1003-auth](auth-common)
+username = endpoint-1003-demo
+password = DemoPass_ChangeMe_1003
+
+[1003](aor-common)
+qualify_frequency = 0
+
+;; Zadarma (no password, identification by IP)
+;[1004]
+;type = endpoint
+;context = from-internal
+;disallow = all
+;allow = alaw,ulaw
+;aors = 1004
+;
+;; AOR for endpoint binding
+;[1004]
+;type = aor
+;max_contacts = 1
+;
+;; Identification by Zadarma server IP addresses
+;[zadarma-identify]
+;type = identify
+;endpoint = 1004
+;match = 185.45.152.216,185.45.155.33
+
+; AOR for inbound reception
+[zadarma]
+type = aor
+
+; Main endpoint for inbound calls
+[zadarma]
+type = endpoint
+context = zadarma-in
+disallow = all
+allow = alaw,ulaw
+aors = zadarma
+direct_media = no
+
+; Map provider hosts to the endpoint
+[zadarma]
+type = identify
+endpoint = zadarma
+;match = sip.zadarma.com
+;match = sipurifr.zadarma.com
+;match = sipde.zadarma.com
+;match = sipuriny.zadarma.com
+match = sip-provider-1.example.invalid
+match = sip-provider-2.example.invalid

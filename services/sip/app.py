@@ -13,17 +13,19 @@ import logging
 import os
 import random
 import re
-import time
 import unicodedata
 import wave
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from services.common.llm_runtime import ChatRuntimeConfig, InvocationContext, fetch_enabled_tools, run_chat_with_tools, load_prompt_by_source, load_greeting_by_source
+from services.common.media_clients import call_stt_service, call_tts_service
+from services.common.runtime_llm_config import get_runtime_llm_config
+from services.common.system_log import append_system_log
 
 
 logger = logging.getLogger(__name__)
@@ -31,42 +33,13 @@ logging.basicConfig(level=logging.INFO)
 
 app = FastAPI(title="colloc-sip-service")
 
-
-def resolve_system_log_path() -> Path:
-    """Resolve writable system log path. Output: absolute path. Input: none."""
-    candidates: list[Path] = []
-    env_path = os.getenv("SYSTEM_LOG_PATH", "").strip()
-    if env_path:
-        candidates.append(Path(env_path))
-    candidates.extend(
-        [
-            Path("/srv/logs/system.log"),
-        ]
-    )
-
-    for path in candidates:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=True)
-            return path
-        except OSError:
-            continue
-
-    return candidates[0]
+# Cache for last STT audio sent to web UI
+_last_stt_audio_cache: dict[str, tuple[bytes, str]] = {}  # wav_bytes, transcript
 
 
-SYSTEM_LOG_PATH = resolve_system_log_path()
-
-
-def append_system_log(component: str, event: str, message: str, details: dict[str, Any] | None = None) -> str:
-    """Append one system log line. Output: written text line. Input: component, event, message, optional details."""
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    line = f"[{timestamp}] {component}.{event}: {message}"
-    if details:
-        line = f"{line} | {json.dumps(details, ensure_ascii=False)}"
-    with open(SYSTEM_LOG_PATH, "a", encoding="utf-8") as handle:
-        handle.write(f"{line}\n")
-    return line
+def cache_stt_audio(wav_bytes: bytes, transcript: str) -> None:
+    """Cache STT audio for web UI retrieval. Output: none. Input: wav bytes and transcript text."""
+    _last_stt_audio_cache["last"] = (wav_bytes, transcript)
 
 
 SIP_ROLE = os.getenv("SIP_ROLE", "ai_scripts/test.md")
@@ -75,6 +48,7 @@ SIP_DEFAULT_LANGUAGE = os.getenv("SIP_DEFAULT_LANGUAGE", "ru")
 SIP_MAX_SILENCE = int(os.getenv("SIP_MAX_SILENCE", "30"))
 SIP_MAX_DURATION = int(os.getenv("SIP_MAX_DURATION", "600"))
 SIP_VAD_THRESHOLD = int(os.getenv("SIP_VAD_THRESHOLD", "450"))
+SIP_ACTIVITY_MIN_ENERGY = int(os.getenv("SIP_ACTIVITY_MIN_ENERGY", str(max(1, SIP_VAD_THRESHOLD))))
 SIP_BARGE_IN_THRESHOLD = int(os.getenv("SIP_BARGE_IN_THRESHOLD", "700"))
 SIP_UTTERANCE_MIN_MS = int(os.getenv("SIP_UTTERANCE_MIN_MS", "350"))
 SIP_UTTERANCE_END_SILENCE_MS = int(os.getenv("SIP_UTTERANCE_END_SILENCE_MS", "850"))
@@ -85,8 +59,6 @@ SIP_BARGE_ADAPTIVE_MIN_FACTOR = float(os.getenv("SIP_BARGE_ADAPTIVE_MIN_FACTOR",
 
 STT_URL = os.getenv("STT_URL", "http://stt:8001")
 TTS_ROUTER_URL = os.getenv("TTS_ROUTER_URL", "http://tts-router:8002")
-LLM_BASE_URL = os.getenv("LLM_PROVIDER_PRIMARY_BASE_URL", "").rstrip("/")
-LLM_MODEL = os.getenv("LLM_PROVIDER_PRIMARY_MODEL", "")
 LLM_TIMEOUT_SEC = float(os.getenv("LLM_REQUEST_TIMEOUT_SEC", "60"))
 
 ASTERISK_HTTP_URL = os.getenv("ASTERISK_HTTP_URL", "http://asterisk:8088/ari").rstrip("/")
@@ -117,6 +89,13 @@ class CallEndRequest(BaseModel):
     """Input model for ending SIP call media session."""
 
     channel_id: str
+    reason: str | None = None
+    source: str | None = None
+    cause: int | None = None
+    cause_txt: str | None = None
+    ari_channel_id: str | None = None
+    bridge_id: str | None = None
+    details: dict[str, Any] | None = None
 
 
 class BargeInRequest(BaseModel):
@@ -124,6 +103,18 @@ class BargeInRequest(BaseModel):
 
     channel_id: str
 
+
+class SipHangupRequest(BaseModel):
+    """Input model for hanging up a SIP call from tools."""
+
+    channel_id: str
+
+
+class SipTransferRequest(BaseModel):
+    """Input model for blind-transferring a SIP call to another extension."""
+
+    channel_id: str
+    target: str
 
 class RtpEndpoint(asyncio.DatagramProtocol):
     """Bidirectional RTP endpoint for one External Media channel."""
@@ -259,6 +250,8 @@ class CallSession:
     barge_silence_frames: int = 0
     barge_last_eval_frames: int = 0
     barge_eval_task: asyncio.Task[None] | None = None
+    stop_reason: str | None = None
+    stop_reason_details: dict[str, Any] = field(default_factory=dict)
 
     def mark_activity(self) -> None:
         """Update last activity time. Output: none. Input: none."""
@@ -275,6 +268,11 @@ class CallSession:
     def current_barge_threshold(self) -> int:
         """Get current adaptive barge-in threshold. Output: threshold int. Input: none."""
         return max(60, int(SIP_BARGE_IN_THRESHOLD * self.adaptive_barge_factor))
+
+    def is_voice_activity(self, energy: int) -> bool:
+        """Check if frame energy should reset silence timer. Output: bool. Input: frame RMS energy."""
+        activity_threshold = max(self.current_vad_threshold(), SIP_ACTIVITY_MIN_ENERGY)
+        return energy >= activity_threshold
 
     def adapt_thresholds(self, energy: int) -> None:
         """Adapt VAD/barge thresholds based on current frame energy. Output: none. Input: RMS energy."""
@@ -309,7 +307,7 @@ class CallSession:
         except asyncio.QueueFull:
             return
 
-        if energy >= self.current_vad_threshold():
+        if self.is_voice_activity(energy):
             self.mark_activity()
 
         self.observe_barge_candidate(pcm16, energy)
@@ -372,24 +370,13 @@ def _read_text_file(path_value: str, fallback: str) -> str:
 
 
 def load_role_prompt() -> str:
-    """Load SIP role prompt. Output: prompt text. Input: none."""
-    return _read_text_file(
-        SIP_ROLE,
-        "You are a helpful AI assistant on a phone call. Keep responses concise and natural.",
-    )
+    """Load SIP role prompt from source-aware config. Output: prompt text. Input: none."""
+    return load_prompt_by_source("sip", "You are a helpful AI assistant on a phone call. Keep responses concise and natural.")
 
 
 def load_greeting() -> tuple[str, bytes | None]:
-    """Load greeting file. Output: text or wav bytes. Input: none."""
-    path = Path(SIP_GREETINGS)
-    if not path.exists():
-        return "Привет! Я на связи. Чем могу помочь?", None
-    if path.suffix.lower() == ".wav":
-        try:
-            return "", path.read_bytes()
-        except Exception:
-            return "Привет! Я на связи. Чем могу помочь?", None
-    return _read_text_file(str(path), "Привет! Я на связи. Чем могу помочь?"), None
+    """Load greeting file (text or WAV) from source-aware config. Output: text or wav bytes. Input: none."""
+    return load_greeting_by_source("sip", "Привет! Я на связи. Чем могу помочь?")
 
 
 def pcm16_to_wav_bytes(pcm16: bytes, sample_rate: int) -> bytes:
@@ -502,7 +489,7 @@ async def evaluate_barge_in_candidate(call: CallSession, pcm8k: bytes) -> None:
     }
     append_system_log("sip", "barge_stt_start", "Barge-in candidate STT started.", details)
     try:
-        transcript = await call_stt_from_pcm8k(pcm8k, call.language, source="barge")
+        transcript = await call_stt_from_pcm8k(pcm8k, None, source="barge")
     except Exception:
         logger.exception("Barge-in STT failed for call %s", call.channel_id)
         append_system_log("sip", "barge_stt_error", "Barge-in candidate STT failed.", details)
@@ -525,8 +512,8 @@ async def evaluate_barge_in_candidate(call: CallSession, pcm8k: bytes) -> None:
         call.playback_task.cancel()
 
 
-async def call_stt_from_pcm8k(pcm8k: bytes, language_hint: str, source: str = "turn") -> str:
-    """Transcribe PCM audio using STT service. Output: transcript text. Input: pcm and language."""
+async def call_stt_from_pcm8k(pcm8k: bytes, language_hint: str | None, source: str = "turn") -> str:
+    """Transcribe PCM audio using STT service. Output: transcript text. Input: pcm and optional language hint."""
     if not pcm8k:
         return ""
     pcm16k, _ = audioop.ratecv(pcm8k, 2, 1, 8000, 16000, None)
@@ -543,56 +530,96 @@ async def call_stt_from_pcm8k(pcm8k: bytes, language_hint: str, source: str = "t
         "STT request started.",
         {"channel_id": source if source.startswith("chan:") else None, "source": source, "bytes": len(pcm8k), "language": language_hint},
     )
-    timeout = httpx.Timeout(120.0, connect=5.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(f"{STT_URL}/transcribe", json=payload)
-        response.raise_for_status()
-        body = response.json()
-        transcript = (body.get("transcript") or "").strip()
-        append_system_log(
-            "sip",
-            "stt_stop",
-            "STT request finished.",
-            {"source": source, "language": language_hint, "text": transcript},
-        )
-        return transcript
+    body = await call_stt_service(payload["audio_b64"], payload["mime_type"], language_hint, stt_url=STT_URL, timeout_sec=120.0)
+    transcript = (body.get("transcript") or "").strip()
+    # Cache audio for web UI playback
+    cache_stt_audio(wav_bytes, transcript)
+    append_system_log(
+        "sip",
+        "stt_stop",
+        "STT request finished.",
+        {"source": source, "language": language_hint, "text": transcript},
+    )
+    return transcript
 
 
-async def call_llm(messages: list[dict[str, Any]]) -> str:
-    """Generate assistant response from LLM endpoint. Output: text. Input: OpenAI-style messages."""
-    if not LLM_BASE_URL or not LLM_MODEL:
-        return "LLM provider is not configured."
+_SENTENCE_END_RE = re.compile(r"[.!?\n]")
 
-    url = f"{LLM_BASE_URL}/v1/chat/completions"
-    request_body = {
-        "model": LLM_MODEL,
-        "messages": messages,
-        "stream": False,
-    }
 
+def _split_on_sentence_boundary(buffer: str) -> tuple[list[str], str]:
+    """Extract complete sentences from a text buffer. Output: (sentences, remainder). Input: accumulated LLM text."""
+    sentences: list[str] = []
+    while True:
+        m = _SENTENCE_END_RE.search(buffer)
+        if not m:
+            break
+        sentence = buffer[: m.end()].strip()
+        if sentence:
+            sentences.append(sentence)
+        buffer = buffer[m.end() :].lstrip()
+    return sentences, buffer
+
+
+async def stream_llm_chunks(messages: list[dict[str, Any]], call: CallSession | None = None):
+    """Stream LLM response as raw text chunks via OpenAI-compatible SSE. Output: async generator of str. Input: messages."""
+    runtime_config = await get_runtime_llm_config()
+    if not runtime_config.primary_base_url or not runtime_config.primary_model:
+        yield "LLM provider is not configured."
+        return
+
+    context = InvocationContext(
+        source="sip",
+        call_id=call.channel_id if call else None,
+        language=call.language if call else None,
+    )
+
+    def _log_sip_event(event: str, message: str, details: dict[str, Any] | None = None) -> None:
+        append_system_log("sip", event, message, details)
+
+    tools = await fetch_enabled_tools(context, _log_sip_event)
+    tool_names = [
+        tool.get("function", {}).get("name", "")
+        for tool in tools
+        if tool.get("function", {}).get("name")
+    ]
     append_system_log(
         "sip",
         "llm_start",
-        "LLM request started.",
-        {"model": LLM_MODEL, "messages": len(messages)},
+        "LLM stream started.",
+        {
+            "model": runtime_config.primary_model,
+            "messages": len(messages),
+            "tools_enabled": bool(tools),
+            "tools_count": len(tools),
+            "available_tools": tool_names,
+        },
     )
-
-    timeout = httpx.Timeout(LLM_TIMEOUT_SEC, connect=5.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(url, json=request_body)
-        response.raise_for_status()
-        body = response.json()
-        try:
-            answer = body["choices"][0]["message"]["content"].strip()
-            append_system_log(
-                "sip",
-                "llm_stop",
-                "LLM request finished.",
-                {"model": LLM_MODEL, "text": answer},
-            )
-            return answer
-        except Exception:
-            return "Не удалось получить ответ модели."
+    try:
+        result = await run_chat_with_tools(
+            messages,
+            ChatRuntimeConfig(
+                base_url=runtime_config.primary_base_url,
+                model=runtime_config.primary_model,
+                timeout_sec=LLM_TIMEOUT_SEC,
+                fallback_base_url=runtime_config.fallback_base_url,
+                fallback_model=runtime_config.fallback_model,
+            ),
+            context,
+            _log_sip_event,
+            tools=tools,
+        )
+        if result.text:
+            yield result.text
+        append_system_log("sip", "llm_stop", "LLM stream finished.", {"model": result.model_used, "text": result.text})
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("LLM stream failed for model %s", runtime_config.primary_model)
+        append_system_log(
+            "sip",
+            "llm_error",
+            "LLM stream failed.",
+            {"model": runtime_config.primary_model, "error": str(exc)},
+        )
+        yield "Извините, не удалось обработать запрос."
 
 
 async def call_tts(text: str, language: str) -> list[bytes]:
@@ -609,10 +636,7 @@ async def call_tts(text: str, language: str) -> list[bytes]:
         {"language": language, "text": text},
     )
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(f"{TTS_ROUTER_URL}/synthesize", json=payload)
-        response.raise_for_status()
-        data = response.json()
+    data = await call_tts_service(text, language, tts_router_url=TTS_ROUTER_URL, timeout_sec=40.0)
 
     segments = data.get("segments") or []
     wavs: list[bytes] = []
@@ -691,9 +715,9 @@ async def speak_text(call: CallSession, text: str, interrupted_mark_target: dict
 
 
 async def process_utterance(call: CallSession, utterance_pcm8k: bytes) -> None:
-    """Run one STT->LLM->TTS turn. Output: none. Input: utterance PCM bytes."""
+    """Run one STT->LLM->TTS turn; TTS starts on first complete sentence. Output: none. Input: utterance PCM bytes."""
     try:
-        transcript = await call_stt_from_pcm8k(utterance_pcm8k, call.language, source="turn")
+        transcript = await call_stt_from_pcm8k(utterance_pcm8k, None, source="turn")
     except Exception:
         logger.exception("STT failed for call %s", call.channel_id)
         return
@@ -708,23 +732,77 @@ async def process_utterance(call: CallSession, utterance_pcm8k: bytes) -> None:
         messages.append({"role": "system", "content": call.role_prompt})
     messages.extend(call.history)
 
-    try:
-        answer = await call_llm(messages)
-    except Exception:
-        logger.exception("LLM failed for call %s", call.channel_id)
-        answer = "Извините, не удалось обработать запрос."
+    # Pipeline: LLM stream → sentence split → TTS synthesis → RTP playback.
+    # TTS for the first sentence starts as soon as the first sentence boundary arrives.
+    tts_wav_queue: asyncio.Queue[list[bytes] | None] = asyncio.Queue()
+    all_sentences: list[str] = []
 
-    assistant_item: dict[str, Any] = {"role": "assistant", "content": answer, "interrupted": False}
-    call.history.append(assistant_item)
+    async def _llm_to_tts_producer() -> None:
+        """Stream LLM, split into sentences, synthesize TTS, enqueue WAV segments."""
+        buffer = ""
+        try:
+            async for chunk in stream_llm_chunks(messages, call=call):
+                if call.stop_event.is_set() or call.interrupted_event.is_set():
+                    break
+                buffer += chunk
+                sentences, buffer = _split_on_sentence_boundary(buffer)
+                for sentence in sentences:
+                    if call.stop_event.is_set() or call.interrupted_event.is_set():
+                        break
+                    all_sentences.append(sentence)
+                    try:
+                        wavs = await call_tts(sentence, call.language)
+                    except Exception:
+                        logger.exception("TTS failed for sentence in call %s", call.channel_id)
+                        wavs = []
+                    if wavs:
+                        tts_wav_queue.put_nowait(wavs)
+            # flush any text remaining after the last boundary
+            remainder = buffer.strip()
+            if remainder and not call.stop_event.is_set() and not call.interrupted_event.is_set():
+                all_sentences.append(remainder)
+                try:
+                    wavs = await call_tts(remainder, call.language)
+                except Exception:
+                    logger.exception("TTS flush failed in call %s", call.channel_id)
+                    wavs = []
+                if wavs:
+                    tts_wav_queue.put_nowait(wavs)
+        except asyncio.CancelledError:
+            pass
+        finally:
+            tts_wav_queue.put_nowait(None)
 
-    playback_task = asyncio.create_task(speak_text(call, answer, assistant_item))
+    async def _streaming_playback() -> None:
+        """Drain TTS WAV queue and play segments; cancel producer on finish/interrupt."""
+        producer_task = asyncio.create_task(_llm_to_tts_producer())
+        try:
+            while True:
+                wavs = await tts_wav_queue.get()
+                if wavs is None:
+                    break
+                if call.stop_event.is_set() or call.interrupted_event.is_set():
+                    break
+                seg_interrupted = await play_wav_segments(call, wavs)
+                if seg_interrupted:
+                    break
+        finally:
+            if not producer_task.done():
+                producer_task.cancel()
+
+    playback_task = asyncio.create_task(_streaming_playback())
     call.playback_task = playback_task
+    interrupted = False
     try:
         await playback_task
     except asyncio.CancelledError:
-        assistant_item["interrupted"] = True
+        interrupted = True
     finally:
         call.playback_task = None
+
+    answer = " ".join(all_sentences)
+    assistant_item: dict[str, Any] = {"role": "assistant", "content": answer, "interrupted": interrupted}
+    call.history.append(assistant_item)
 
 
 async def call_pipeline_loop(call: CallSession) -> None:
@@ -776,7 +854,7 @@ async def call_pipeline_loop(call: CallSession) -> None:
             break
 
         pcm, energy = item
-        is_voiced = energy >= call.current_vad_threshold()
+        is_voiced = call.is_voice_activity(energy)
 
         if is_voiced:
             call.mark_activity()
@@ -828,6 +906,17 @@ async def call_watchdog_loop(call: CallSession) -> None:
 
         if duration > SIP_MAX_DURATION:
             logger.info("Call %s exceeded SIP_MAX_DURATION", call.channel_id)
+            call.stop_reason = "watchdog_max_duration"
+            call.stop_reason_details = {
+                "duration_sec": round(duration, 2),
+                "max_duration_sec": SIP_MAX_DURATION,
+            }
+            append_system_log(
+                "sip",
+                "call_timeout",
+                "Call exceeded maximum duration and hangup was requested.",
+                {"channel_id": call.channel_id, **call.stop_reason_details},
+            )
             await ari_hangup_channel(call.channel_id)
             call.stop_event.set()
             return
@@ -841,6 +930,23 @@ async def call_watchdog_loop(call: CallSession) -> None:
                 call.rx_last_payload_type,
                 call.rx_last_energy,
                 call.rx_peak_energy,
+            )
+            call.stop_reason = "watchdog_max_silence"
+            call.stop_reason_details = {
+                "idle_sec": round(idle, 2),
+                "max_silence_sec": SIP_MAX_SILENCE,
+                "is_playing": is_playing,
+                "rtp_packets": call.rx_total_packets,
+                "audio_packets": call.rx_audio_packets,
+                "last_pt": call.rx_last_payload_type,
+                "last_energy": call.rx_last_energy,
+                "peak_energy": call.rx_peak_energy,
+            }
+            append_system_log(
+                "sip",
+                "call_timeout",
+                "Call exceeded silence timeout and hangup was requested.",
+                {"channel_id": call.channel_id, **call.stop_reason_details},
             )
             await ari_hangup_channel(call.channel_id)
             call.stop_event.set()
@@ -898,8 +1004,12 @@ async def start_call_session(req: CallStartRequest) -> dict[str, Any]:
     return {"status": "started", "channel_id": req.channel_id, "media_port": req.media_port}
 
 
-async def stop_call_session(channel_id: str) -> dict[str, Any]:
-    """Stop call runtime and cleanup resources. Output: status dict. Input: channel id."""
+async def stop_call_session(
+    channel_id: str,
+    reason: str | None = None,
+    reason_details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Stop call runtime and cleanup resources. Output: status dict. Input: channel id and optional reason details."""
     async with active_calls_lock:
         call = active_calls.pop(channel_id, None)
 
@@ -931,6 +1041,13 @@ async def stop_call_session(channel_id: str) -> dict[str, Any]:
     if call.rtp_transport:
         call.rtp_transport.close()
 
+    effective_reason = reason or call.stop_reason or "unknown"
+    effective_details: dict[str, Any] = {}
+    if call.stop_reason_details:
+        effective_details.update(call.stop_reason_details)
+    if reason_details:
+        effective_details.update(reason_details)
+
     logger.info(
         "Stopped SIP call session channel=%s rtp_packets=%s audio_packets=%s unknown_pt=%s last_pt=%s last_energy=%s peak_energy=%s vad_factor=%.2f barge_factor=%.2f",
         channel_id,
@@ -949,6 +1066,8 @@ async def stop_call_session(channel_id: str) -> dict[str, Any]:
         "SIP call session stopped.",
         {
             "channel_id": channel_id,
+            "reason": effective_reason,
+            "reason_details": effective_details,
             "rtp_packets": call.rx_total_packets,
             "audio_packets": call.rx_audio_packets,
             "unknown_pt": call.rx_unknown_pt_packets,
@@ -966,6 +1085,21 @@ async def stop_call_session(channel_id: str) -> dict[str, Any]:
 async def health() -> dict[str, Any]:
     """Health endpoint. Output: service info. Input: none."""
     return {"status": "ok", "service": "sip", "active_calls": len(active_calls)}
+
+
+@app.get("/stt-audio/last")
+async def get_last_stt_audio() -> dict[str, Any]:
+    """Get last STT audio and transcript. Output: WAV bytes in base64 and metadata. Input: none."""
+    if "last" not in _last_stt_audio_cache:
+        return {"has_data": False, "message": "No STT audio cached yet"}
+    wav_bytes, transcript = _last_stt_audio_cache["last"]
+    return {
+        "has_data": True,
+        "audio_b64": base64.b64encode(wav_bytes).decode("ascii"),
+        "audio_mime": "audio/wav",
+        "transcript": transcript,
+        "bytes": len(wav_bytes),
+    }
 
 
 @app.get("/ari/calls")
@@ -996,7 +1130,21 @@ async def ari_call_start(req: CallStartRequest) -> dict[str, Any]:
 @app.post("/ari/call/end")
 async def ari_call_end(req: CallEndRequest) -> dict[str, Any]:
     """End call session from ARI listener. Output: status dict. Input: end payload."""
-    return await stop_call_session(req.channel_id)
+    details: dict[str, Any] = {}
+    if req.source:
+        details["source"] = req.source
+    if req.cause is not None:
+        details["cause"] = req.cause
+    if req.cause_txt:
+        details["cause_txt"] = req.cause_txt
+    if req.ari_channel_id:
+        details["ari_channel_id"] = req.ari_channel_id
+    if req.bridge_id:
+        details["bridge_id"] = req.bridge_id
+    if req.details:
+        details["ari_details"] = req.details
+
+    return await stop_call_session(req.channel_id, reason=req.reason, reason_details=details)
 
 
 @app.post("/ari/call/barge-in")
@@ -1024,3 +1172,73 @@ async def on_shutdown() -> None:
             await stop_call_session(channel_id)
         except Exception:
             logger.exception("Failed to stop call during shutdown: %s", channel_id)
+
+
+@app.post("/sip/call/hangup")
+async def sip_call_hangup(req: SipHangupRequest) -> dict[str, Any]:
+    """Hang up an active SIP call. Output: status dict. Input: channel_id."""
+    call = active_calls.get(req.channel_id)
+    if not call:
+        return {"status": "not_found", "channel_id": req.channel_id}
+    await stop_call_session(req.channel_id)
+    append_system_log("sip", "tool_hangup", "Call hung up via tool.", {"channel_id": req.channel_id})
+    return {"status": "ok", "channel_id": req.channel_id, "action": "hangup"}
+
+
+@app.post("/sip/call/transfer")
+async def sip_call_transfer(req: SipTransferRequest) -> dict[str, Any]:
+    """Blind transfer an active SIP call to a target extension. Output: status dict. Input: channel_id and target."""
+    call = active_calls.get(req.channel_id)
+    if not call:
+        return {"status": "not_found", "channel_id": req.channel_id}
+
+    continue_url = f"{ASTERISK_HTTP_URL}/channels/{req.channel_id}/continue"
+    continue_params = {
+        "extension": req.target,
+        "context": "internal-users",
+        "priority": "1",
+    }
+    redirect_url = f"{ASTERISK_HTTP_URL}/channels/{req.channel_id}/redirect"
+    redirect_params = {
+        "endpoint": f"PJSIP/{req.target}",
+    }
+
+    method_used = ""
+    continue_error = ""
+    try:
+        async with httpx.AsyncClient(
+            auth=(ASTERISK_ARI_USER, ASTERISK_ARI_PASSWORD), timeout=8.0
+        ) as client:
+            # Prefer dialplan continue: this reliably exits Stasis and routes by extension.
+            try:
+                continue_resp = await client.post(continue_url, params=continue_params)
+                continue_resp.raise_for_status()
+                method_used = "continue"
+            except httpx.HTTPStatusError as exc:
+                continue_error = f"HTTP {exc.response.status_code}"
+                # Fallback to redirect for cases where continue is rejected by channel state.
+                redirect_resp = await client.post(redirect_url, params=redirect_params)
+                redirect_resp.raise_for_status()
+                method_used = "redirect"
+    except httpx.HTTPStatusError as exc:
+        return {"status": "error", "channel_id": req.channel_id, "detail": f"ARI error {exc.response.status_code}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "channel_id": req.channel_id, "detail": str(exc)}
+
+    append_system_log(
+        "sip", "tool_transfer", "Call transferred via tool.",
+        {
+            "channel_id": req.channel_id,
+            "target": req.target,
+            "method": method_used,
+            "continue_error": continue_error,
+        },
+    )
+    return {
+        "status": "ok",
+        "channel_id": req.channel_id,
+        "action": "transfer",
+        "target": req.target,
+        "method": method_used,
+        "continue_error": continue_error,
+    }

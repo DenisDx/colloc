@@ -385,6 +385,15 @@
         font-size: 13px;
       }
 
+      .query-panel input[type="text"] {
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 9px 10px;
+        background: rgba(11, 20, 32, 0.9);
+        color: var(--text);
+        font-size: 13px;
+      }
+
       .query-fieldset {
         border: 1px solid var(--line);
         border-radius: 12px;
@@ -561,11 +570,14 @@
             <div id="voice-state" class="muted">State: disconnected</div>
             <div class="buttons">
               <button id="connect-btn" class="secondary" type="button">Connect session</button>
+              <button id="close-session-btn" class="secondary" type="button" disabled>Close session</button>
               <button id="start-btn" class="primary" type="button">Start microphone</button>
               <button id="stop-btn" class="danger" type="button">Stop microphone</button>
-              <button id="play-chunk-btn" type="button" disabled>▶ Play last sent fragment</button>
+              <button id="play-chunk-btn" type="button" disabled>▶ Play last audio</button>
               <button id="stop-playback-btn" class="danger" type="button" disabled>■ Stop playback</button>
-              <button id="reset-system-btn" class="danger" type="button">Reset system</button>
+              <button id="reset-system-btn" class="danger" type="button">Restart system</button>
+              <button id="stop-services-btn" class="danger" type="button">Stop services</button>
+              <button id="start-services-btn" class="secondary" type="button">Start services</button>
               <button id="refresh-devices-btn" type="button">Refresh devices</button>
             </div>
             <div id="playback-state" class="playback-state idle">Playback: idle</div>
@@ -663,16 +675,25 @@
             <input id="temperature-input" type="range" min="0" max="2" step="0.05" value="0.70">
             <span id="temperature-value" class="muted">0.70</span>
             <label class="autoscroll-label" for="reasoning-toggle">
-              <input id="reasoning-toggle" type="checkbox">
+              <input id="reasoning-toggle" type="checkbox" disabled>
               Reasoning
             </label>
             <label class="autoscroll-label" for="autoload-toggle">
-              <input id="autoload-toggle" type="checkbox">
+              <input id="autoload-toggle" type="checkbox" disabled>
               Keep models loaded
             </label>
           </div>
+          <div class="prompt-row">
+            <label for="llm-primary-base-url">LLM server</label>
+            <input id="llm-primary-base-url" type="text" placeholder="http://host:11434" spellcheck="false">
+            <label for="llm-primary-model">LLM model</label>
+            <input id="llm-primary-model" type="text" placeholder="model:tag" spellcheck="false">
+          </div>
           <textarea id="system-prompt" placeholder="System prompt (optional, overrides role if set)" rows="2"></textarea>
-          <button id="apply-config-btn" class="secondary" type="button" style="width:fit-content">Apply config</button>
+          <div class="prompt-row">
+            <button id="test-llm-config-btn" class="secondary" type="button" style="width:fit-content">Test LLM config</button>
+            <button id="apply-config-btn" class="secondary" type="button" style="width:fit-content">Apply config</button>
+          </div>
         </fieldset>
 
         <div class="typing-indicator" id="typing-indicator"></div>
@@ -685,6 +706,14 @@
       <section class="card system-log-card">
         <div class="chat-header">
           <h2>System log</h2>
+          <label class="autoscroll-label" for="system-log-autoscroll-toggle">
+            <input id="system-log-autoscroll-toggle" type="checkbox" checked>
+            Scroll down
+          </label>
+          <label class="autoscroll-label" for="system-log-update-toggle">
+            <input id="system-log-update-toggle" type="checkbox" checked>
+            Update
+          </label>
           <label class="autoscroll-label" for="system-log-poll-interval">
             Poll <span id="system-log-poll-interval-value">1.0 s</span>
             <input id="system-log-poll-interval" type="range" min="100" max="10000" step="100" value="1000">

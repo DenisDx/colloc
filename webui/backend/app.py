@@ -8,12 +8,50 @@ import subprocess
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel
+from services.common.llm_runtime import ChatRuntimeConfig, InvocationContext, fetch_enabled_tools, run_chat_with_tools, load_prompt_by_source, load_greeting_by_source
+from services.common.media_clients import call_stt_service, call_tts_service
+from services.common.runtime_llm_config import (
+    LlmRuntimeConfig,
+    RuntimeConfigError,
+    apply_runtime_config_to_env,
+    get_runtime_llm_config,
+    set_runtime_llm_config,
+)
+from services.common.system_log import append_system_log, resolve_system_log_path, utc_timestamp
+
+try:
+    import pynvml as _pynvml
+
+    nvmlInit = getattr(_pynvml, "nvmlInit", None)
+    nvmlGetDeviceCount = getattr(_pynvml, "nvmlGetDeviceCount", getattr(_pynvml, "nvmlDeviceGetCount", None))
+    nvmlGetDeviceByIndex = getattr(
+        _pynvml,
+        "nvmlGetDeviceByIndex",
+        getattr(_pynvml, "nvmlDeviceGetHandleByIndex", None),
+    )
+    nvmlDeviceGetMemoryInfo = getattr(_pynvml, "nvmlDeviceGetMemoryInfo", None)
+    NVMLError = getattr(_pynvml, "NVMLError", Exception)
+
+    PYNVML_AVAILABLE = all(
+        callable(func) for func in (nvmlInit, nvmlGetDeviceCount, nvmlGetDeviceByIndex, nvmlDeviceGetMemoryInfo)
+    )
+    if PYNVML_AVAILABLE:
+        try:
+            nvmlInit()
+        except Exception:
+            PYNVML_AVAILABLE = False
+except ImportError:
+    PYNVML_AVAILABLE = False
+    nvmlInit = None
+    nvmlGetDeviceCount = None
+    nvmlGetDeviceByIndex = None
+    nvmlDeviceGetMemoryInfo = None
+    NVMLError = Exception
 
 
 app = FastAPI(title="colloc-webui-backend")
@@ -36,6 +74,41 @@ class AutoloadToggleRequest(BaseModel):
     """Runtime request to enable/disable keep-models-loaded behavior. Output: parsed body. Input: enabled boolean."""
 
     enabled: bool
+
+
+class LlmRuntimeConfigRequest(BaseModel):
+    """Runtime request to change primary/fallback LLM routing. Output: parsed body. Input: server/model values."""
+
+    primary_base_url: str
+    primary_model: str
+    fallback_base_url: str | None = None
+    fallback_model: str | None = None
+    autoload_enabled: bool | None = None
+
+
+class LlmRuntimeConfigTestRequest(BaseModel):
+    """Runtime request to test primary LLM routing values. Output: parsed body. Input: server/model values."""
+
+    primary_base_url: str
+    primary_model: str
+
+
+def _llm_runtime_to_dict(config: LlmRuntimeConfig) -> dict[str, Any]:
+    """Convert runtime config to API-safe dict. Output: dict. Input: runtime config."""
+    return {
+        "primary_base_url": config.primary_base_url,
+        "primary_model": config.primary_model,
+        "fallback_base_url": config.fallback_base_url,
+        "fallback_model": config.fallback_model,
+        "autoload_enabled": config.autoload_enabled,
+    }
+
+
+async def _load_runtime_llm_config() -> LlmRuntimeConfig:
+    """Load runtime LLM config and apply it to process env. Output: config. Input: none."""
+    config = await get_runtime_llm_config()
+    apply_runtime_config_to_env(config)
+    return config
 
 
 async def _preload_stt() -> None:
@@ -117,6 +190,21 @@ def _default_system_reset_command() -> str:
     return f"{compose_base} down && {compose_base} up -d"
 
 
+def _derive_hook_url(base_hook_url: str, endpoint: str) -> str:
+    """Build hook URL from reset hook URL and endpoint. Output: URL string. Input: base URL and endpoint path."""
+    cleaned = base_hook_url.strip()
+    if not cleaned:
+        return ""
+    if cleaned.endswith("/restart-services"):
+        return f"{cleaned.rsplit('/restart-services', 1)[0]}{endpoint}"
+    return f"{cleaned.rstrip('/')}{endpoint}"
+
+
+def load_webui_default_prompt() -> str:
+    """Load default Web UI system prompt from env. Output: prompt text. Input: none."""
+    return load_prompt_by_source("webui", "")
+
+
 async def _preload_tts() -> None:
     """Preload TTS models via HTTP for all configured providers. Output: none. Input: none."""
     endpoints = _active_tts_preload_endpoints()
@@ -132,26 +220,38 @@ async def _preload_tts() -> None:
             append_system_log("autoload", f"{name}_error", f"{name} preload failed: {exc}")
 
 
+async def _trigger_llm_reload_once(config: LlmRuntimeConfig, source: str) -> None:
+    """Send minimal request to keep configured model hot. Output: none. Input: runtime config and source tag."""
+    llm_url = config.primary_base_url.rstrip("/")
+    model = config.primary_model
+    if not llm_url or not model:
+        append_system_log("autoload", "llm_reload_skip", "LLM reload skipped due to empty config.", {"source": source})
+        return
+
+    timeout = httpx.Timeout(120.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            f"{llm_url}/api/generate",
+            json={
+                "model": model,
+                "prompt": "ok",
+                "stream": False,
+            },
+        )
+        resp.raise_for_status()
+
+
 async def _reload_llm_loop() -> None:
     """Periodically reload LLM model to keep it in VRAM. Output: none. Input: none."""
+    global _AUTOLOAD_ENABLED
     while True:
         try:
             await asyncio.sleep(_LLM_RELOAD_INTERVAL_SEC)
-            if not _AUTOLOAD_ENABLED:
+            runtime_config = await _load_runtime_llm_config()
+            _AUTOLOAD_ENABLED = runtime_config.autoload_enabled
+            if not runtime_config.autoload_enabled:
                 continue
-            timeout = httpx.Timeout(120.0, connect=5.0)
-            llm_url = os.getenv("LLM_PROVIDER_PRIMARY_BASE_URL", "http://ollama:11434").rstrip("/")
-            # Try to trigger a minimal generate call to keep model loaded
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    f"{llm_url}/api/generate",
-                    json={
-                        "model": os.getenv("LLM_PROVIDER_PRIMARY_MODEL", ""),
-                        "prompt": "ok",
-                        "stream": False,
-                    },
-                )
-                resp.raise_for_status()
+            await _trigger_llm_reload_once(runtime_config, "interval")
             append_system_log("autoload", "llm_reload", "LLM model reloaded to keep in VRAM")
         except asyncio.CancelledError:
             break
@@ -196,7 +296,11 @@ async def _set_autoload_runtime_enabled(enabled: bool) -> None:
 @app.on_event("startup")
 async def startup_preload() -> None:
     """Preload models on startup if AUTOLOAD is enabled. Output: none. Input: none."""
-    global _LLM_RELOAD_TASK
+    global _LLM_RELOAD_TASK, _AUTOLOAD_ENABLED
+    runtime_config = await _load_runtime_llm_config()
+    _AUTOLOAD_ENABLED = runtime_config.autoload_enabled
+    append_system_log("runtime", "llm_config_loaded", "Runtime LLM config applied at startup.", _llm_runtime_to_dict(runtime_config))
+
     if not _AUTOLOAD_ENABLED:
         return
 
@@ -219,43 +323,7 @@ def shutdown_cleanup() -> None:
     if _AUTOLOAD_PRELOAD_TASK is not None and not _AUTOLOAD_PRELOAD_TASK.done():
         _AUTOLOAD_PRELOAD_TASK.cancel()
 
-
-
-def resolve_system_log_path() -> Path:
-    """Resolve writable system log path. Output: absolute path. Input: none."""
-    candidates: list[Path] = []
-    env_path = os.getenv("SYSTEM_LOG_PATH", "").strip()
-    if env_path:
-        candidates.append(Path(env_path))
-    candidates.extend(
-        [
-            Path("/srv/logs/system.log"),
-        ]
-    )
-
-    for path in candidates:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=True)
-            return path
-        except OSError:
-            continue
-
-    return candidates[0]
-
-
 SYSTEM_LOG_PATH = resolve_system_log_path()
-
-
-def append_system_log(component: str, event: str, message: str, details: dict[str, Any] | None = None) -> str:
-    """Append one system log line. Output: written text line. Input: component, event, message, optional details."""
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    line = f"[{timestamp}] {component}.{event}: {message}"
-    if details:
-        line = f"{line} | {json.dumps(details, ensure_ascii=False)}"
-    with open(SYSTEM_LOG_PATH, "a", encoding="utf-8") as handle:
-        handle.write(f"{line}\n")
-    return line
 
 
 def build_reasoning_payload(base_url: str, enabled: bool) -> dict[str, Any]:
@@ -289,8 +357,11 @@ def get_memory_usage_mb() -> float:
     return round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2)
 
 
-def get_host_memory_snapshot() -> dict[str, float]:
-    """Get host memory snapshot. Output: memory dict. Input: none."""
+def get_host_memory_snapshot() -> dict[str, Any]:
+    """Get host memory snapshot. Output: memory dict with RAM and VRAM. Input: none."""
+    result: dict[str, Any] = {}
+    
+    # Get RAM from /proc/meminfo
     meminfo: dict[str, int] = {}
     with open("/proc/meminfo", encoding="utf-8") as handle:
         for line in handle:
@@ -301,12 +372,126 @@ def get_host_memory_snapshot() -> dict[str, float]:
     available_kb = meminfo.get("MemAvailable", 0)
     used_kb = max(total_kb - available_kb, 0)
 
-    return {
+    result["ram"] = {
         "total_mb": round(total_kb / 1024.0, 2),
         "used_mb": round(used_kb / 1024.0, 2),
         "available_mb": round(available_kb / 1024.0, 2),
         "used_percent": round((used_kb / total_kb) * 100, 2) if total_kb else 0.0,
     }
+    
+    # Get VRAM using pynvml
+    if PYNVML_AVAILABLE:
+        try:
+            device_count = nvmlGetDeviceCount()
+            if device_count > 0:
+                # Get first GPU
+                device = nvmlGetDeviceByIndex(0)
+                mem_info = nvmlDeviceGetMemoryInfo(device)
+                result["vram"] = {
+                    "total_mb": round(mem_info.total / (1024 * 1024), 2),
+                    "used_mb": round(mem_info.used / (1024 * 1024), 2),
+                    "available_mb": round(mem_info.free / (1024 * 1024), 2),
+                    "used_percent": round((mem_info.used / mem_info.total) * 100, 2) if mem_info.total > 0 else 0.0,
+                }
+            else:
+                result["vram"] = {"error": "No NVIDIA GPU detected"}
+        except NVMLError as exc:
+            result["vram"] = {"error": f"NVIDIA driver error: {exc}"}
+        except Exception as exc:  # noqa: BLE001
+            result["vram"] = {"error": f"Failed to query VRAM: {exc}"}
+    else:
+        result["vram"] = {"error": "pynvml not available in venv (install pynvml or nvidia-ml-py)"}
+    
+    return result
+
+
+async def get_ollama_models() -> dict[str, Any]:
+    """Get loaded models from ollama. Output: models dict. Input: none."""
+    try:
+        runtime_config = await _load_runtime_llm_config()
+        ollama_base_url = runtime_config.primary_base_url or "http://ollama:11434"
+        timeout = httpx.Timeout(2.0, connect=1.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{ollama_base_url}/api/ps")
+            resp.raise_for_status()
+            data = resp.json()
+            models = {}
+            for model in data.get("models", []):
+                name = model.get("name", "unknown")
+                size = model.get("size", 0)
+                models[name] = {
+                    "size_mb": round(size / (1024 * 1024), 2),
+                    "size_gb": round(size / (1024 * 1024 * 1024), 2),
+                }
+            return {"loaded_models": models}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": str(exc)}
+
+
+async def get_service_models_memory() -> dict[str, Any]:
+    """Get loaded models info from our services with device info. Output: models dict. Input: none."""
+    result: dict[str, Any] = {}
+    
+    timeout = httpx.Timeout(2.0, connect=1.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        # Get piper info (CPU/GPU device aware)
+        for lang in ["en", "ru", "zh"]:
+            try:
+                resp = await client.get(f"http://piper-{lang}:6020/metrics", timeout=timeout)
+                if resp.status_code == 200:
+                    metrics = resp.json()
+                    if "piper" not in result:
+                        result["piper"] = {}
+                    result["piper"][lang] = {
+                        "cached_voices": metrics.get("cached_voices", []),
+                        "active_voice": metrics.get("active_voice"),
+                        "memory_mb": metrics.get("memory_mb"),
+                        "device": metrics.get("device", "cpu"),
+                    }
+            except Exception:  # noqa: BLE001
+                pass
+        
+        # Get kokoro info
+        try:
+            resp = await client.get("http://kokoro:6030/metrics", timeout=timeout)
+            if resp.status_code == 200:
+                metrics = resp.json()
+                result["kokoro"] = {
+                    "health": metrics.get("health", "unknown"),
+                    "memory_mb": metrics.get("memory_mb"),
+                    "device": metrics.get("device", "cpu"),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # Get silero info
+        try:
+            resp = await client.get("http://silero:6040/metrics", timeout=timeout)
+            if resp.status_code == 200:
+                metrics = resp.json()
+                result["silero"] = {
+                    "models_loaded": metrics.get("models_loaded", []),
+                    "memory_mb": metrics.get("memory_mb"),
+                    "device": metrics.get("device", "cpu"),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+        
+        # Get STT info
+        try:
+            resp = await client.get("http://stt:8001/metrics", timeout=timeout)
+            if resp.status_code == 200:
+                metrics = resp.json()
+                result["stt"] = {
+                    "memory_mb": metrics.get("memory_mb"),
+                    "model": metrics.get("models", {}).get("stt_model"),
+                    "device": metrics.get("models", {}).get("stt_device", "gpu"),
+                    "compute_type": metrics.get("models", {}).get("stt_compute_type"),
+                }
+        except Exception:  # noqa: BLE001
+            pass
+    
+    return result
 
 
 @app.middleware("http")
@@ -387,6 +572,103 @@ async def fetch_service_status(
     return result
 
 
+def collect_recent_sip_events(limit: int = 8) -> list[str]:
+    """Collect recent SIP lifecycle lines from system log. Output: list of log lines. Input: max line count."""
+    interesting = {
+        "sip.ari_start",
+        "sip.ari_ready",
+        "sip.ari_stop",
+        "sip.call_start",
+        "sip.call_stop",
+        "sip.call_timeout",
+        "sip.ari_channel_destroyed",
+    }
+    lines = tail_system_log(250)
+    matched = [line for line in lines if any(token in line for token in interesting)]
+    return matched[-limit:]
+
+
+async def build_asterisk_status(client: httpx.AsyncClient) -> dict[str, Any]:
+    """Build Asterisk/SIP diagnostics block for status page. Output: service-style status dict. Input: HTTP client."""
+    asterisk_http_url = os.getenv("ASTERISK_HTTP_URL", "http://asterisk:8088/ari").rstrip("/")
+    asterisk_ari_user = os.getenv("ASTERISK_ARI_USER", "colloc")
+    asterisk_ari_password = os.getenv("ASTERISK_ARI_PASSWORD", "change-me")
+    asterisk_ari_app = os.getenv("ASTERISK_ARI_APP", "colloc-call-handler")
+    sip_service_url = os.getenv("ASTERISK_SIP_SERVICE_URL", "http://sip-service:8004").rstrip("/")
+
+    result: dict[str, Any] = {
+        "name": "asterisk",
+        "health": "unknown",
+        "latency_ms": None,
+        "memory_mb": None,
+        "requests_total": None,
+        "requests_by_path": {},
+        "details": {
+            "ari_app": asterisk_ari_app,
+            "ari_url": asterisk_http_url,
+            "sip_service_url": sip_service_url,
+            "active_calls_count": 0,
+            "active_calls": [],
+            "recent_events": collect_recent_sip_events(),
+            "config": {
+                "sip_max_silence_sec": int(os.getenv("SIP_MAX_SILENCE", "30")),
+                "sip_max_duration_sec": int(os.getenv("SIP_MAX_DURATION", "600")),
+                "asterisk_pjsip_port": int(os.getenv("ASTERISK_PJSIP_PORT", "6060")),
+                "asterisk_rtp_start": int(os.getenv("ASTERISK_RTP_START", "6700")),
+                "asterisk_rtp_end": int(os.getenv("ASTERISK_RTP_END", "6800")),
+            },
+        },
+    }
+
+    ari_ok = False
+    ari_started_at = time.perf_counter()
+    try:
+        ari_response = await client.get(
+            f"{asterisk_http_url}/asterisk/info",
+            auth=(asterisk_ari_user, asterisk_ari_password),
+        )
+        ari_response.raise_for_status()
+        ari_ok = True
+        result["latency_ms"] = round((time.perf_counter() - ari_started_at) * 1000, 2)
+        ari_body = ari_response.json() if ari_response.content else {}
+        result["details"]["ari_info"] = {
+            "system": ari_body.get("system"),
+            "asterisk_id": ari_body.get("asterisk_id"),
+            "version": ari_body.get("version"),
+        }
+    except Exception as exc:  # noqa: BLE001
+        result["details"]["ari_error"] = str(exc)
+
+    sip_ok = False
+    try:
+        sip_health = await client.get(f"{sip_service_url}/health")
+        sip_health.raise_for_status()
+        health_body = sip_health.json() if sip_health.content else {}
+        sip_ok = str(health_body.get("status", "")).lower() == "ok"
+        result["details"]["sip_health"] = health_body
+    except Exception as exc:  # noqa: BLE001
+        result["details"]["sip_health_error"] = str(exc)
+
+    try:
+        calls_response = await client.get(f"{sip_service_url}/ari/calls")
+        calls_response.raise_for_status()
+        calls_payload = calls_response.json() if calls_response.content else {}
+        active_calls = calls_payload.get("active", []) if isinstance(calls_payload, dict) else []
+        result["details"]["active_calls_count"] = len(active_calls)
+        result["details"]["active_calls"] = active_calls
+    except Exception as exc:  # noqa: BLE001
+        result["details"]["active_calls_error"] = str(exc)
+
+    if ari_ok and sip_ok:
+        result["health"] = "ok"
+    elif (not ari_ok) and (not sip_ok):
+        result["health"] = "down"
+    else:
+        result["health"] = "unknown"
+
+    return result
+
+
 async def build_system_snapshot() -> dict[str, Any]:
     """Build system status snapshot. Output: full snapshot dict. Input: none."""
     timeout = httpx.Timeout(2.0, connect=1.0)
@@ -407,6 +689,7 @@ async def build_system_snapshot() -> dict[str, Any]:
                 for preload_url, name in _active_tts_preload_endpoints()
             ],
         )
+        asterisk_status = await build_asterisk_status(client)
 
     redis_ok = False
     try:
@@ -432,25 +715,17 @@ async def build_system_snapshot() -> dict[str, Any]:
         }
     )
 
-    checks.append(
-        {
-            "name": "asterisk",
-            "health": "unknown",
-            "latency_ms": None,
-            "memory_mb": None,
-            "requests_total": None,
-            "requests_by_path": {},
-            "details": {
-                "note": "Container-level health must be provided by orchestrator checks.",
-            },
-        }
-    )
+    checks.append(asterisk_status)
 
     return {
         "type": "system.status",
-        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "timestamp": utc_timestamp(),
         "runtime": build_runtime_snapshot(),
         "host_memory": get_host_memory_snapshot(),
+        "models": {
+            "ollama": await get_ollama_models(),
+            "services": await get_service_models_memory(),
+        },
         "services": checks,
     }
 
@@ -473,10 +748,136 @@ def autoload_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/llm-runtime-config")
+async def llm_runtime_config_get() -> dict[str, Any]:
+    """Return active runtime LLM config. Output: config dict. Input: none."""
+    runtime_config = await _load_runtime_llm_config()
+    return {"status": "ok", **_llm_runtime_to_dict(runtime_config)}
+
+
+@app.post("/api/llm-runtime-config")
+async def llm_runtime_config_set(request: LlmRuntimeConfigRequest) -> dict[str, Any]:
+    """Update runtime LLM config in Redis and current process env. Output: config dict. Input: request body."""
+    previous_autoload_enabled = _AUTOLOAD_ENABLED
+    current = await _load_runtime_llm_config()
+    merged = LlmRuntimeConfig(
+        primary_base_url=request.primary_base_url,
+        primary_model=request.primary_model,
+        fallback_base_url=current.fallback_base_url if request.fallback_base_url is None else request.fallback_base_url,
+        fallback_model=current.fallback_model if request.fallback_model is None else request.fallback_model,
+        autoload_enabled=current.autoload_enabled if request.autoload_enabled is None else request.autoload_enabled,
+    )
+
+    try:
+        saved = await set_runtime_llm_config(merged)
+    except RuntimeConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Failed to persist runtime LLM config: {exc}") from exc
+
+    apply_runtime_config_to_env(saved)
+    if previous_autoload_enabled != saved.autoload_enabled:
+        await _set_autoload_runtime_enabled(saved.autoload_enabled)
+    append_system_log("runtime", "llm_config_updated", "Runtime LLM config updated.", _llm_runtime_to_dict(saved))
+
+    if saved.autoload_enabled:
+        try:
+            await _trigger_llm_reload_once(saved, "runtime_update")
+            append_system_log("autoload", "llm_reload", "LLM model reloaded after runtime config update")
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("autoload", "llm_reload_error", f"LLM reload after runtime config update failed: {exc}")
+
+    return {"status": "ok", **_llm_runtime_to_dict(saved)}
+
+
+@app.post("/api/llm-runtime-config/test")
+async def llm_runtime_config_test(request: LlmRuntimeConfigTestRequest) -> dict[str, Any]:
+    """Test primary LLM server/model with one short chat completion call. Output: test result. Input: request body."""
+    base_url = request.primary_base_url.strip().rstrip("/")
+    model = request.primary_model.strip()
+
+    if not base_url or not model:
+        raise HTTPException(status_code=400, detail="primary_base_url and primary_model are required")
+
+    started_at = time.perf_counter()
+    timeout = httpx.Timeout(20.0, connect=3.0)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "ping"}],
+        "stream": False,
+        "max_tokens": 16,
+        "temperature": 0.0,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(f"{base_url}/v1/chat/completions", json=payload)
+            response.raise_for_status()
+            body = response.json()
+
+        preview = ""
+        choices = body.get("choices") if isinstance(body, dict) else None
+        if isinstance(choices, list) and choices:
+            first = choices[0] if isinstance(choices[0], dict) else {}
+            message = first.get("message") if isinstance(first, dict) else {}
+            preview = str(message.get("content", ""))[:200] if isinstance(message, dict) else ""
+
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        append_system_log(
+            "runtime",
+            "llm_config_test_ok",
+            "Runtime LLM config test succeeded.",
+            {
+                "primary_base_url": base_url,
+                "primary_model": model,
+                "duration_ms": duration_ms,
+            },
+        )
+        return {
+            "status": "ok",
+            "primary_base_url": base_url,
+            "primary_model": model,
+            "duration_ms": duration_ms,
+            "response_preview": preview,
+        }
+    except Exception as exc:  # noqa: BLE001
+        duration_ms = int((time.perf_counter() - started_at) * 1000)
+        append_system_log(
+            "runtime",
+            "llm_config_test_error",
+            "Runtime LLM config test failed.",
+            {
+                "primary_base_url": base_url,
+                "primary_model": model,
+                "duration_ms": duration_ms,
+                "error": str(exc),
+            },
+        )
+        raise HTTPException(status_code=502, detail=f"LLM config test failed: {exc}") from exc
+
+
 @app.post("/api/autoload-status")
 async def autoload_set_status(request: AutoloadToggleRequest) -> dict[str, Any]:
-    """Set runtime keep-models-loaded state until process restart. Output: status dict. Input: enabled boolean."""
+    """Set runtime keep-models-loaded state and persist it. Output: status dict. Input: enabled boolean."""
+    current = await _load_runtime_llm_config()
+    merged = LlmRuntimeConfig(
+        primary_base_url=current.primary_base_url,
+        primary_model=current.primary_model,
+        fallback_base_url=current.fallback_base_url,
+        fallback_model=current.fallback_model,
+        autoload_enabled=bool(request.enabled),
+    )
+
+    try:
+        saved = await set_runtime_llm_config(merged)
+    except RuntimeConfigError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"Failed to persist runtime autoload config: {exc}") from exc
+
+    apply_runtime_config_to_env(saved)
     await _set_autoload_runtime_enabled(request.enabled)
+    append_system_log("runtime", "autoload_updated", "Runtime autoload setting updated.", {"autoload_enabled": saved.autoload_enabled})
     return autoload_status()
 
 
@@ -510,13 +911,13 @@ async def autoload_preload_now() -> dict[str, Any]:
 
 @app.post("/api/system-reset")
 async def system_reset() -> dict[str, Any]:
-    """Trigger full system reset via configured reset backend. Output: status dict. Input: none."""
+    """Trigger full system restart via configured reset backend. Output: status dict. Input: none."""
     reset_mode = os.getenv("SYSTEM_RESET_MODE", "command").strip().lower()
     hook_url = os.getenv("SYSTEM_RESET_HOOK_URL", "").strip()
     reset_command = os.getenv("SYSTEM_RESET_COMMAND", "").strip() or _default_system_reset_command()
     reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
 
-    append_system_log("system", "reset.requested", "System reset requested via API.", {"mode": reset_mode})
+    append_system_log("system", "reset.requested", "System restart requested via API.", {"mode": reset_mode})
 
     if reset_mode == "hook":
         if not hook_url:
@@ -555,6 +956,92 @@ async def system_reset() -> dict[str, Any]:
     raise HTTPException(status_code=400, detail="Unsupported SYSTEM_RESET_MODE. Use 'hook' or 'command'.")
 
 
+@app.post("/api/system-stop-services")
+async def system_stop_services() -> dict[str, Any]:
+    """Stop non-core services via hook/command backend. Output: status dict. Input: none."""
+    reset_mode = os.getenv("SYSTEM_RESET_MODE", "command").strip().lower()
+    hook_url = _derive_hook_url(os.getenv("SYSTEM_RESET_HOOK_URL", "").strip(), "/stop-services")
+    stop_command = os.getenv("SYSTEM_STOP_SERVICES_COMMAND", "").strip()
+    reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
+
+    append_system_log("system", "stop_services.requested", "Stop services requested via API.", {"mode": reset_mode})
+
+    if reset_mode == "hook":
+        if not hook_url:
+            raise HTTPException(status_code=400, detail="SYSTEM_RESET_HOOK_URL is empty for hook mode.")
+        timeout = httpx.Timeout(30.0, connect=3.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(hook_url, json={"source": "webui-backend", "requested_at": time.time()})
+                resp.raise_for_status()
+                payload = resp.json() if resp.content else {}
+            append_system_log("system", "stop_services.dispatched", "Stop services request dispatched to hook.", {"hook_url": hook_url})
+            return {"status": "accepted", "mode": "hook", **payload}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "stop_services.error", f"Stop services hook failed: {exc}", {"hook_url": hook_url})
+            raise HTTPException(status_code=502, detail=f"Stop services hook failed: {exc}") from exc
+
+    if reset_mode == "command":
+        if not stop_command:
+            raise HTTPException(status_code=400, detail="SYSTEM_STOP_SERVICES_COMMAND is empty for command mode.")
+        try:
+            subprocess.Popen(
+                ["/bin/sh", "-lc", f"cd {shlex.quote(reset_cwd)} && ({stop_command})"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            append_system_log("system", "stop_services.dispatched", "Stop services command started.", {"cwd": reset_cwd})
+            return {"status": "accepted", "mode": "command", "message": "Stop services command started."}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "stop_services.error", f"Stop services command failed: {exc}", {"cwd": reset_cwd})
+            raise HTTPException(status_code=500, detail=f"Stop services command failed: {exc}") from exc
+
+    raise HTTPException(status_code=400, detail="Unsupported SYSTEM_RESET_MODE. Use 'hook' or 'command'.")
+
+
+@app.post("/api/system-start-services")
+async def system_start_services() -> dict[str, Any]:
+    """Start previously stopped services via hook/command backend. Output: status dict. Input: none."""
+    reset_mode = os.getenv("SYSTEM_RESET_MODE", "command").strip().lower()
+    hook_url = _derive_hook_url(os.getenv("SYSTEM_RESET_HOOK_URL", "").strip(), "/start-services")
+    start_command = os.getenv("SYSTEM_START_SERVICES_COMMAND", "").strip()
+    reset_cwd = os.getenv("SYSTEM_RESET_CWD", "/app").strip() or "/app"
+
+    append_system_log("system", "start_services.requested", "Start services requested via API.", {"mode": reset_mode})
+
+    if reset_mode == "hook":
+        if not hook_url:
+            raise HTTPException(status_code=400, detail="SYSTEM_RESET_HOOK_URL is empty for hook mode.")
+        timeout = httpx.Timeout(30.0, connect=3.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(hook_url, json={"source": "webui-backend", "requested_at": time.time()})
+                resp.raise_for_status()
+                payload = resp.json() if resp.content else {}
+            append_system_log("system", "start_services.dispatched", "Start services request dispatched to hook.", {"hook_url": hook_url})
+            return {"status": "accepted", "mode": "hook", **payload}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "start_services.error", f"Start services hook failed: {exc}", {"hook_url": hook_url})
+            raise HTTPException(status_code=502, detail=f"Start services hook failed: {exc}") from exc
+
+    if reset_mode == "command":
+        if not start_command:
+            raise HTTPException(status_code=400, detail="SYSTEM_START_SERVICES_COMMAND is empty for command mode.")
+        try:
+            subprocess.Popen(
+                ["/bin/sh", "-lc", f"cd {shlex.quote(reset_cwd)} && ({start_command})"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            append_system_log("system", "start_services.dispatched", "Start services command started.", {"cwd": reset_cwd})
+            return {"status": "accepted", "mode": "command", "message": "Start services command started."}
+        except Exception as exc:  # noqa: BLE001
+            append_system_log("system", "start_services.error", f"Start services command failed: {exc}", {"cwd": reset_cwd})
+            raise HTTPException(status_code=500, detail=f"Start services command failed: {exc}") from exc
+
+    raise HTTPException(status_code=400, detail="Unsupported SYSTEM_RESET_MODE. Use 'hook' or 'command'.")
+
+
 @app.get("/api/runtime")
 def get_runtime() -> dict[str, object]:
     """Return backend runtime snapshot. Output: runtime dict. Input: none."""
@@ -582,6 +1069,35 @@ def metrics() -> dict[str, object]:
 async def system_status() -> dict[str, Any]:
     """Return system status snapshot. Output: snapshot dict. Input: none."""
     return await build_system_snapshot()
+
+
+@app.get("/api/memory")
+async def memory_info() -> dict[str, Any]:
+    """Return detailed memory and models info. Output: memory snapshot dict. Input: none."""
+    return {
+        "type": "memory.snapshot",
+        "timestamp": utc_timestamp(),
+        "host_memory": get_host_memory_snapshot(),
+        "models": {
+            "ollama": await get_ollama_models(),
+            "services": await get_service_models_memory(),
+        },
+    }
+
+
+@app.get("/api/sip-stt-audio/last")
+async def sip_last_stt_audio() -> dict[str, Any]:
+    """Fetch last STT audio from SIP service. Output: audio metadata and base64. Input: none."""
+    try:
+        timeout = httpx.Timeout(3.0, connect=1.0)
+        sip_service_url = os.getenv("ASTERISK_SIP_SERVICE_URL", "http://sip-service:8004").rstrip("/")
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(f"{sip_service_url}/stt-audio/last")
+            resp.raise_for_status()
+            data = resp.json()
+            return data
+    except Exception as exc:  # noqa: BLE001
+        return {"has_data": False, "error": str(exc)}
 
 
 @app.get("/api/log")
@@ -780,28 +1296,20 @@ class _SessionState:
 
 async def _call_stt(audio_b64: str, mime_type: str, language_hint: str | None) -> dict[str, Any]:
     """Transcribe audio via STT service. Output: result dict. Input: base64 audio, MIME type, optional language hint."""
-    timeout = httpx.Timeout(120.0, connect=5.0)
-    payload: dict[str, Any] = {"audio_b64": audio_b64, "mime_type": mime_type, "partial": False}
-    if language_hint:
-        payload["language_hint"] = language_hint
-
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post("http://stt:8001/transcribe", json=payload)
-            resp.raise_for_status()
-            body = resp.json()
-            return {
-                "transcript": body.get("transcript", ""),
-                "provider": str(body.get("provider", {}).get("primary", "")),
-                "device": str(body.get("provider", {}).get("device", "")),
-                "device_runtime": str(body.get("provider", {}).get("device_runtime", "")),
-                "compute_type": str(body.get("provider", {}).get("compute_type", "")),
-                "timings_ms": body.get("timings_ms", {}),
-                "error": "",
-                "status_code": resp.status_code,
-                "response_detail": "",
-                "response_preview": "",
-            }
+        body = await call_stt_service(audio_b64, mime_type, language_hint)
+        return {
+            "transcript": body.get("transcript", ""),
+            "provider": str(body.get("provider", {}).get("primary", "")),
+            "device": str(body.get("provider", {}).get("device", "")),
+            "device_runtime": str(body.get("provider", {}).get("device_runtime", "")),
+            "compute_type": str(body.get("provider", {}).get("compute_type", "")),
+            "timings_ms": body.get("timings_ms", {}),
+            "error": "",
+            "status_code": 200,
+            "response_detail": "",
+            "response_preview": "",
+        }
     except httpx.HTTPStatusError as exc:
         response_preview = (exc.response.text or "")[:1000]
         response_detail = ""
@@ -853,12 +1361,8 @@ async def _call_stt(audio_b64: str, mime_type: str, language_hint: str | None) -
 
 async def _call_tts(text: str) -> dict[str, Any]:
     """Prepare TTS playback plan via router. Output: TTS payload dict. Input: text."""
-    timeout = httpx.Timeout(30.0, connect=2.0)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.post("http://tts-router:8002/synthesize", json={"text": text})
-            response.raise_for_status()
-            return response.json()
+        return await call_tts_service(text)
     except Exception as exc:  # noqa: BLE001
         return {"mode": "error", "error": str(exc), "segments": []}
 
@@ -946,8 +1450,9 @@ async def _stream_tts_chunks(
 
 async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
     """Stream LLM response tokens back through websocket. Output: none. Input: websocket, session state."""
-    base_url = os.getenv("LLM_PROVIDER_PRIMARY_BASE_URL", "").rstrip("/")
-    model = os.getenv("LLM_PROVIDER_PRIMARY_MODEL", "")
+    runtime_config = await _load_runtime_llm_config()
+    base_url = runtime_config.primary_base_url
+    model = runtime_config.primary_model
 
     websocket_send_lock = asyncio.Lock()
 
@@ -973,7 +1478,17 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
     last_user_message = next((msg["content"] for msg in reversed(messages) if msg.get("role") == "user"), "")
     reasoning_payload = build_reasoning_payload(base_url, session.reasoning)
     temperature_payload = build_temperature_payload(base_url, session.temperature)
+    context = InvocationContext(source="webui")
 
+    def _log_llm_event(event: str, message: str, details: dict[str, Any] | None = None) -> None:
+        append_system_log("llm", event, message, details)
+
+    tools = await fetch_enabled_tools(context, _log_llm_event)
+    tool_names = [
+        tool.get("function", {}).get("name", "")
+        for tool in tools
+        if tool.get("function", {}).get("name")
+    ]
     append_system_log(
         "llm",
         "request",
@@ -985,97 +1500,62 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
             "temperature": session.temperature,
             "reasoning_payload": reasoning_payload,
             "temperature_payload": temperature_payload,
+            "tools_enabled": bool(tools),
+            "tools_count": len(tools),
+            "available_tools": tool_names,
             "last_user_preview": last_user_message[:200],
             "system_message_preview": messages[0]["content"][:200] if messages and messages[0].get("role") == "system" else "",
         },
     )
     await send_event({"type": "llm.start"})
 
-    request_body = {"model": model, "messages": messages, "stream": True, **reasoning_payload, **temperature_payload}
-    url = f"{base_url}/v1/chat/completions"
-    timeout = httpx.Timeout(60.0, connect=5.0)
-
-    full_response = ""
-    tts_buffer = ""
-    tts_chunk_index = 0
-    tts_queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
-    tts_task = asyncio.create_task(_stream_tts_chunks(websocket, send_event, tts_queue))
-
-    async def handle_token(token: str) -> None:
-        """Accumulate token into response and live TTS queue. Output: none. Input: token text."""
-        nonlocal full_response, tts_buffer, tts_chunk_index
-        full_response += token
-        tts_buffer += token
-        ready_chunks, tts_buffer = _split_ready_tts_chunks(tts_buffer)
-        for chunk_text in ready_chunks:
-            tts_chunk_index += 1
-            await tts_queue.put((tts_chunk_index, chunk_text))
-
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            async with client.stream("POST", url, json=request_body) as resp:
-                resp.raise_for_status()
-                async for raw_line in resp.aiter_lines():
-                    line = raw_line.strip()
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = __import__("json").loads(data)
-                        token = chunk["choices"][0].get("delta", {}).get("content", "")
-                        if token:
-                            await handle_token(token)
-                            await send_event({"type": "llm.token", "token": token})
-                    except (KeyError, ValueError):
-                        pass
-
+        result = await run_chat_with_tools(
+            messages,
+            ChatRuntimeConfig(
+                base_url=base_url,
+                model=model,
+                timeout_sec=60.0,
+                request_options={**reasoning_payload, **temperature_payload},
+                fallback_base_url=runtime_config.fallback_base_url,
+                fallback_model=runtime_config.fallback_model,
+            ),
+            context,
+            _log_llm_event,
+            tools=tools,
+        )
     except Exception as exc:  # noqa: BLE001
-        # Attempt fallback provider
-        fallback_url = os.getenv("LLM_PROVIDER_FALLBACK_BASE_URL", "").rstrip("/")
-        fallback_model = os.getenv("LLM_PROVIDER_FALLBACK_MODEL", "")
-        if fallback_url and fallback_model and fallback_url != base_url:
-            append_system_log(
-                "llm",
-                "fallback",
-                "Primary LLM failed; switching to fallback provider.",
-                {"error": str(exc), "fallback_model": fallback_model},
-            )
-            await send_event({"type": "llm.warn", "message": f"Primary LLM failed ({exc}), trying fallback."})
-            fallback_body = {**request_body, "model": fallback_model}
-            fallback_endpoint = f"{fallback_url}/v1/chat/completions"
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async with client.stream("POST", fallback_endpoint, json=fallback_body) as resp:
-                        resp.raise_for_status()
-                        async for raw_line in resp.aiter_lines():
-                            line = raw_line.strip()
-                            if not line or not line.startswith("data:"):
-                                continue
-                            data = line[len("data:"):].strip()
-                            if data == "[DONE]":
-                                break
-                            try:
-                                chunk = __import__("json").loads(data)
-                                token = chunk["choices"][0].get("delta", {}).get("content", "")
-                                if token:
-                                    await handle_token(token)
-                                    await send_event({"type": "llm.token", "token": token})
-                            except (KeyError, ValueError):
-                                pass
-            except Exception as fb_exc:  # noqa: BLE001
-                await send_event({"type": "error", "message": f"Fallback LLM also failed: {fb_exc}"})
-                await tts_queue.put(None)
-                await tts_task
-                return
-        else:
-            await send_event({"type": "error", "message": f"LLM request failed: {exc}"})
-            await tts_queue.put(None)
-            await tts_task
-            return
+        append_system_log(
+            "llm",
+            "error",
+            "LLM request failed.",
+            {"model": model, "error": str(exc)},
+        )
+        await send_event({"type": "error", "message": f"LLM request failed: {exc}"})
+        return
+
+    if result.fallback_error:
+        await send_event({"type": "llm.warn", "message": f"Primary LLM failed ({result.fallback_error}), trying fallback."})
+
+    full_response = result.text
 
     if full_response:
+        tts_buffer = ""
+        tts_chunk_index = 0
+        tts_queue: asyncio.Queue[tuple[int, str] | None] = asyncio.Queue()
+        tts_task = asyncio.create_task(_stream_tts_chunks(websocket, send_event, tts_queue))
+
+        async def handle_token(token: str) -> None:
+            """Accumulate token into response and live TTS queue. Output: none. Input: token text."""
+            nonlocal tts_buffer, tts_chunk_index
+            tts_buffer += token
+            ready_chunks, tts_buffer = _split_ready_tts_chunks(tts_buffer)
+            for chunk_text in ready_chunks:
+                tts_chunk_index += 1
+                await tts_queue.put((tts_chunk_index, chunk_text))
+
+        await handle_token(full_response)
+        await send_event({"type": "llm.token", "token": full_response})
         tail_chunks, _ = _split_ready_tts_chunks(tts_buffer, flush=True)
         for chunk_text in tail_chunks:
             tts_chunk_index += 1
@@ -1088,8 +1568,8 @@ async def _stream_llm(websocket: WebSocket, session: "_SessionState") -> None:
             {"chars": len(full_response), "text_preview": full_response[:200]},
         )
         await send_event({"type": "llm.done", "text": full_response})
-    await tts_queue.put(None)
-    await tts_task
+        await tts_queue.put(None)
+        await tts_task
 
 
 

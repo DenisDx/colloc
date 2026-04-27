@@ -1,7 +1,10 @@
 const connectButton = document.getElementById("connect-btn");
+const closeSessionButton = document.getElementById("close-session-btn");
 const startButton = document.getElementById("start-btn");
 const stopButton = document.getElementById("stop-btn");
 const resetSystemButton = document.getElementById("reset-system-btn");
+const stopServicesButton = document.getElementById("stop-services-btn");
+const startServicesButton = document.getElementById("start-services-btn");
 const playChunkButton = document.getElementById("play-chunk-btn");
 const stopPlaybackButton = document.getElementById("stop-playback-btn");
 const playbackStateNode = document.getElementById("playback-state");
@@ -36,6 +39,8 @@ const chatLogNode = document.getElementById("chat-log");
 const chatScrollNode = document.getElementById("chat-scroll");
 const systemLogNode = document.getElementById("system-log");
 const systemLogScrollNode = document.getElementById("system-log-scroll");
+const systemLogAutoscrollToggle = document.getElementById("system-log-autoscroll-toggle");
+const systemLogUpdateToggle = document.getElementById("system-log-update-toggle");
 const systemLogPollIntervalInput = document.getElementById("system-log-poll-interval");
 const systemLogPollIntervalValueNode = document.getElementById("system-log-poll-interval-value");
 const autoscrollToggle = document.getElementById("autoscroll-toggle");
@@ -45,6 +50,9 @@ const temperatureInput = document.getElementById("temperature-input");
 const temperatureValueNode = document.getElementById("temperature-value");
 const reasoningToggle = document.getElementById("reasoning-toggle");
 const autoloadToggle = document.getElementById("autoload-toggle");
+const llmPrimaryBaseUrlInput = document.getElementById("llm-primary-base-url");
+const llmPrimaryModelInput = document.getElementById("llm-primary-model");
+const testLlmConfigButton = document.getElementById("test-llm-config-btn");
 const applyConfigButton = document.getElementById("apply-config-btn");
 const textInputNode = document.getElementById("text-input");
 const sendTextButton = document.getElementById("send-text-btn");
@@ -110,6 +118,9 @@ let ttsPlaybackQueue = [];
 let ttsPlaybackInProgress = false;
 let isResizingLayout = false;
 let autoloadStatusRequestInFlight = false;
+let serviceControlRequestInFlight = false;
+let llmRuntimeConfigRequestInFlight = false;
+let llmRuntimeConfigTestRequestInFlight = false;
 
 const VAD_PRESETS = {
   near: { relaxation: 0.06, activation: 0.18, floorMin: 0.035 },
@@ -525,7 +536,7 @@ function setSystemLog(lines) {
     return;
   }
   systemLogNode.textContent = lines && lines.length > 0 ? lines.join("\n") : "No system log yet.";
-  if (systemLogScrollNode) {
+  if (systemLogScrollNode && (!systemLogAutoscrollToggle || systemLogAutoscrollToggle.checked)) {
     systemLogScrollNode.scrollTop = systemLogScrollNode.scrollHeight;
   }
 }
@@ -536,7 +547,7 @@ function appendSystemLogLine(line) {
     return;
   }
   systemLogNode.textContent = `${systemLogNode.textContent}\n${line}`.trim();
-  if (systemLogScrollNode) {
+  if (systemLogScrollNode && (!systemLogAutoscrollToggle || systemLogAutoscrollToggle.checked)) {
     systemLogScrollNode.scrollTop = systemLogScrollNode.scrollHeight;
   }
 }
@@ -588,24 +599,51 @@ async function applyPlaybackDevice(audio) {
   }
 }
 
-// Play last sent utterance fragment via hidden Audio element. Output: none. Input: none.
+// Play last sent utterance fragment or last STT audio from SIP. Output: none. Input: none.
 async function playLastChunk() {
-  if (!lastChunkBlob) {
-    appendEvent("No sent fragment available.");
+  // Try local sent fragment first
+  if (lastChunkBlob) {
+    const url = URL.createObjectURL(lastChunkBlob);
+    const audio = new Audio(url);
+    await applyPlaybackDevice(audio);
+    audio.onended = () => URL.revokeObjectURL(url);
+    audio.onerror = () => {
+      appendEvent("Playback error: browser could not decode sent fragment audio.");
+      URL.revokeObjectURL(url);
+    };
+    audio.play().catch((err) => appendEvent(`Playback error: ${err.message}`));
+    appendEvent(`Playing last sent fragment (${lastChunkBlob.size} bytes, type: ${lastChunkBlob.type || "unknown"}).`);
     return;
   }
-  const url = URL.createObjectURL(lastChunkBlob);
-  const audio = new Audio(url);
 
-  await applyPlaybackDevice(audio);
-
-  audio.onended = () => URL.revokeObjectURL(url);
-  audio.onerror = () => {
-    appendEvent("Playback error: browser could not decode sent fragment audio.");
-    URL.revokeObjectURL(url);
-  };
-  audio.play().catch((err) => appendEvent(`Playback error: ${err.message}`));
-  appendEvent(`Playing last sent fragment (${lastChunkBlob.size} bytes, type: ${lastChunkBlob.type || "unknown"}).`);
+  // Try SIP STT audio from backend
+  try {
+    const resp = await fetch("/api/sip-stt-audio/last");
+    const data = await resp.json();
+    if (!data.has_data) {
+      appendEvent("No sent fragment or SIP STT audio available.");
+      return;
+    }
+    const binaryString = atob(data.audio_b64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    const blob = new Blob([bytes], { type: data.audio_mime });
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    await applyPlaybackDevice(audio);
+    audio.onended = () => URL.revokeObjectURL(url);
+    audio.onerror = () => {
+      appendEvent("Playback error: browser could not decode SIP STT audio.");
+      URL.revokeObjectURL(url);
+    };
+    audio.play().catch((err) => appendEvent(`Playback error: ${err.message}`));
+    const transcript = data.transcript ? ` [${data.transcript}]` : "";
+    appendEvent(`Playing SIP STT audio (${data.bytes} bytes)${transcript}`);
+  } catch (err) {
+    appendEvent(`Failed to fetch SIP STT audio: ${err.message}`);
+  }
 }
 
 // Finalize accumulated utterance blobs and send to backend. Output: none. Input: none.
@@ -704,10 +742,139 @@ function sendText() {
   textInputNode.value = "";
 }
 
+// Load runtime LLM server/model config from backend. Output: none. Input: none.
+async function loadLlmRuntimeConfig() {
+  if (!llmPrimaryBaseUrlInput || !llmPrimaryModelInput) {
+    return;
+  }
+  try {
+    const response = await fetch("/api/llm-runtime-config");
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    llmPrimaryBaseUrlInput.value = payload.primary_base_url || "";
+    llmPrimaryModelInput.value = payload.primary_model || "";
+    if (autoloadToggle && typeof payload.autoload_enabled === "boolean") {
+      autoloadToggle.checked = payload.autoload_enabled;
+    }
+  } catch (err) {
+    appendEvent(`Runtime LLM config load error: ${err.message || err}`);
+  }
+}
+
+// Persist runtime LLM server/model config in backend. Output: success bool. Input: none.
+async function applyLlmRuntimeConfig() {
+  if (!llmPrimaryBaseUrlInput || !llmPrimaryModelInput) {
+    return true;
+  }
+
+  if (llmRuntimeConfigRequestInFlight) {
+    return false;
+  }
+
+  const primary_base_url = (llmPrimaryBaseUrlInput.value || "").trim();
+  const primary_model = (llmPrimaryModelInput.value || "").trim();
+  const autoload_enabled = autoloadToggle ? !!autoloadToggle.checked : undefined;
+  if (!primary_base_url || !primary_model) {
+    appendEvent("LLM server and model are required.");
+    return false;
+  }
+
+  llmRuntimeConfigRequestInFlight = true;
+  if (applyConfigButton) {
+    applyConfigButton.disabled = true;
+  }
+
+  try {
+    const response = await fetch("/api/llm-runtime-config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ primary_base_url, primary_model, autoload_enabled }),
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || `HTTP ${response.status}`);
+    }
+    const payload = await response.json();
+    llmPrimaryBaseUrlInput.value = payload.primary_base_url || primary_base_url;
+    llmPrimaryModelInput.value = payload.primary_model || primary_model;
+    if (autoloadToggle && typeof payload.autoload_enabled === "boolean") {
+      autoloadToggle.checked = payload.autoload_enabled;
+    }
+    appendEvent(`Runtime LLM config applied: ${llmPrimaryBaseUrlInput.value} / ${llmPrimaryModelInput.value}, keep models loaded=${autoloadToggle ? autoloadToggle.checked : false}.`);
+    return true;
+  } catch (err) {
+    appendEvent(`Runtime LLM config apply error: ${err.message || err}`);
+    return false;
+  } finally {
+    llmRuntimeConfigRequestInFlight = false;
+    if (applyConfigButton) {
+      applyConfigButton.disabled = false;
+    }
+  }
+}
+
+// Test runtime LLM server/model without saving config. Output: none. Input: none.
+async function testLlmRuntimeConfig() {
+  if (!llmPrimaryBaseUrlInput || !llmPrimaryModelInput || llmRuntimeConfigTestRequestInFlight) {
+    return;
+  }
+
+  const primary_base_url = (llmPrimaryBaseUrlInput.value || "").trim();
+  const primary_model = (llmPrimaryModelInput.value || "").trim();
+  if (!primary_base_url || !primary_model) {
+    appendEvent("LLM server and model are required for test.");
+    return;
+  }
+
+  llmRuntimeConfigTestRequestInFlight = true;
+  if (testLlmConfigButton) {
+    testLlmConfigButton.disabled = true;
+  }
+  if (applyConfigButton) {
+    applyConfigButton.disabled = true;
+  }
+
+  try {
+    const response = await fetch("/api/llm-runtime-config/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ primary_base_url, primary_model }),
+    });
+
+    if (!response.ok) {
+      const detail = await response.text();
+      throw new Error(detail || `HTTP ${response.status}`);
+    }
+
+    const payload = await response.json();
+    appendEvent(`LLM config test OK (${payload.duration_ms} ms): ${payload.primary_base_url} / ${payload.primary_model}`);
+    if (payload.response_preview) {
+      appendEvent(`LLM test response: ${payload.response_preview}`);
+    }
+  } catch (err) {
+    appendEvent(`LLM config test failed: ${err.message || err}`);
+  } finally {
+    llmRuntimeConfigTestRequestInFlight = false;
+    if (testLlmConfigButton) {
+      testLlmConfigButton.disabled = false;
+    }
+    if (applyConfigButton) {
+      applyConfigButton.disabled = false;
+    }
+  }
+}
+
 // Send system prompt and role configuration to backend. Output: none. Input: none.
-function sendSessionConfig() {
+async function sendSessionConfig() {
+  const runtimeApplied = await applyLlmRuntimeConfig();
+  if (!runtimeApplied) {
+    return;
+  }
+
   if (!socket || socket.readyState !== WebSocket.OPEN) {
-    appendEvent("Connect session to apply config.");
+    appendEvent("Runtime LLM config applied. Connect session to apply role/prompt config.");
     return;
   }
   const system_prompt = (systemPromptNode.value || "").trim();
@@ -732,6 +899,7 @@ async function refreshAutoloadStatus() {
     return;
   }
   autoloadStatusRequestInFlight = true;
+  syncControlButtons();
   try {
     const response = await fetch("/api/autoload-status");
     if (!response.ok) {
@@ -744,10 +912,11 @@ async function refreshAutoloadStatus() {
     appendEvent(`Keep-models-loaded status error: ${err.message || err}`);
   } finally {
     autoloadStatusRequestInFlight = false;
+    syncControlButtons();
   }
 }
 
-// Update runtime keep-models-loaded state until backend restart. Output: none. Input: none.
+// Update runtime keep-models-loaded state and persist it in backend config. Output: none. Input: none.
 async function setAutoloadEnabled(enabled) {
   if (!autoloadToggle) {
     return;
@@ -764,12 +933,12 @@ async function setAutoloadEnabled(enabled) {
     }
     const payload = await response.json();
     autoloadToggle.checked = !!payload.enabled;
-    appendEvent(`Keep models loaded ${payload.enabled ? "enabled" : "disabled"}.`);
+    appendEvent(`Keep models loaded ${payload.enabled ? "enabled" : "disabled"} (saved).`);
   } catch (err) {
     autoloadToggle.checked = !enabled;
     appendEvent(`Keep-models-loaded toggle error: ${err.message || err}`);
   } finally {
-    autoloadToggle.disabled = false;
+    syncControlButtons();
   }
 }
 
@@ -1133,20 +1302,43 @@ function syncControlButtons() {
   if (connectButton) {
     connectButton.disabled = isSessionConnected() || isSessionConnecting();
   }
+  if (closeSessionButton) {
+    closeSessionButton.disabled = !isSessionConnected() && !isSessionConnecting();
+  }
   if (startButton) {
     startButton.disabled = !isSessionConnected() || isMicrophoneRecording();
   }
   if (stopButton) {
     stopButton.disabled = !isMicrophoneRecording();
   }
+  const sessionReady = isSessionConnected();
+  if (reasoningToggle) {
+    reasoningToggle.disabled = !sessionReady;
+  }
+  if (autoloadToggle) {
+    autoloadToggle.disabled = autoloadStatusRequestInFlight;
+  }
 }
 
-// Request backend-triggered full system reset. Output: none. Input: none.
+// Close active websocket session only. Output: none. Input: none.
+function closeSession() {
+  if (!socket || (socket.readyState !== WebSocket.OPEN && socket.readyState !== WebSocket.CONNECTING)) {
+    appendEvent("Session is already closed.");
+    syncControlButtons();
+    return;
+  }
+
+  socket.close(1000, "Manual session close");
+  appendEvent("Closing session...");
+  syncControlButtons();
+}
+
+// Request backend-triggered system restart. Output: none. Input: none.
 async function resetSystem() {
   if (!resetSystemButton) {
     return;
   }
-  const confirmed = window.confirm("This will trigger full system restart. Continue?");
+  const confirmed = window.confirm("This will restart all system services. Continue?");
   if (!confirmed) {
     return;
   }
@@ -1160,13 +1352,84 @@ async function resetSystem() {
     });
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(payload.message || `HTTP ${response.status}`);
+      throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
     }
-    appendEvent(`System reset requested: ${payload.message || "accepted"}.`);
+    appendEvent(`System restart requested: ${payload.message || "accepted"}.`);
   } catch (err) {
-    appendEvent(`System reset failed: ${err.message || err}`);
+    appendEvent(`System restart failed: ${err.message || err}`);
   } finally {
     resetSystemButton.disabled = false;
+  }
+}
+
+// Request host hook to stop all non-core/non-UI services. Output: none. Input: none.
+async function stopServices() {
+  if (!stopServicesButton || serviceControlRequestInFlight) {
+    return;
+  }
+  const confirmed = window.confirm("This will stop non-core services and keep Web UI/core alive. Continue?");
+  if (!confirmed) {
+    return;
+  }
+
+  serviceControlRequestInFlight = true;
+  stopServicesButton.disabled = true;
+  if (startServicesButton) {
+    startServicesButton.disabled = true;
+  }
+  try {
+    const response = await fetch("/api/system-stop-services", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: "manual-ui-request" }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
+    }
+    const stopped = Array.isArray(payload.stopped_services) ? payload.stopped_services.join(", ") : "none";
+    appendEvent(`Stop services requested: ${payload.message || "accepted"}. Stopped: ${stopped}.`);
+  } catch (err) {
+    appendEvent(`Stop services failed: ${err.message || err}`);
+  } finally {
+    serviceControlRequestInFlight = false;
+    stopServicesButton.disabled = false;
+    if (startServicesButton) {
+      startServicesButton.disabled = false;
+    }
+  }
+}
+
+// Request host hook to start services that were stopped by Stop services. Output: none. Input: none.
+async function startServices() {
+  if (!startServicesButton || serviceControlRequestInFlight) {
+    return;
+  }
+  serviceControlRequestInFlight = true;
+  startServicesButton.disabled = true;
+  if (stopServicesButton) {
+    stopServicesButton.disabled = true;
+  }
+  try {
+    const response = await fetch("/api/system-start-services", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason: "manual-ui-request" }),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.detail || payload.message || `HTTP ${response.status}`);
+    }
+    const started = Array.isArray(payload.started_services) ? payload.started_services.join(", ") : "none";
+    appendEvent(`Start services requested: ${payload.message || "accepted"}. Started: ${started}.`);
+  } catch (err) {
+    appendEvent(`Start services failed: ${err.message || err}`);
+  } finally {
+    serviceControlRequestInFlight = false;
+    startServicesButton.disabled = false;
+    if (stopServicesButton) {
+      stopServicesButton.disabled = false;
+    }
   }
 }
 
@@ -1451,6 +1714,7 @@ function connectSession() {
   socket.addEventListener("open", () => {
     setVoiceState("connected");
     appendEvent("WebSocket connected.");
+    refreshAutoloadStatus();
     syncControlButtons();
   });
 
@@ -1509,6 +1773,12 @@ function connectSession() {
     }
     setVoiceState("disconnected");
     appendEvent("WebSocket closed.");
+    if (autoloadToggle) {
+      autoloadToggle.disabled = true;
+    }
+    if (reasoningToggle) {
+      reasoningToggle.disabled = true;
+    }
     syncControlButtons();
   });
 
@@ -1521,6 +1791,9 @@ function connectSession() {
 
 // Connect dedicated websocket stream for system log panel. Output: none. Input: none.
 async function fetchSystemLogSnapshot() {
+  if (systemLogUpdateToggle && !systemLogUpdateToggle.checked) {
+    return;
+  }
   if (systemLogPollingInFlight) {
     return;
   }
@@ -1821,11 +2094,42 @@ function stopMicrophone() {
   }
 }
 
+// Check for SIP STT audio availability and enable button. Output: none. Input: none.
+async function updateSipSttAudioAvailability() {
+  try {
+    const resp = await fetch("/api/sip-stt-audio/last");
+    if (!resp.ok) return;
+    const data = await resp.json();
+    if (data.has_data && !lastChunkBlob) {
+      // Enable button only if no local audio available
+      playChunkButton.disabled = false;
+      playChunkButton.title = `SIP STT: ${data.transcript || "(no transcript)"}`;
+    }
+  } catch (err) {
+    // Silent fail, just keep button disabled
+  }
+}
+
+// Start periodic check for SIP audio
+setInterval(updateSipSttAudioAvailability, 2000);
+
 connectButton.addEventListener("click", connectSession);
+if (closeSessionButton) {
+  closeSessionButton.addEventListener("click", closeSession);
+}
 startButton.addEventListener("click", () => { startMicrophone(); });
 stopButton.addEventListener("click", stopMicrophone);
 if (resetSystemButton) {
   resetSystemButton.addEventListener("click", resetSystem);
+}
+if (stopServicesButton) {
+  stopServicesButton.addEventListener("click", stopServices);
+}
+if (startServicesButton) {
+  startServicesButton.addEventListener("click", startServices);
+}
+if (testLlmConfigButton) {
+  testLlmConfigButton.addEventListener("click", testLlmRuntimeConfig);
 }
 playChunkButton.addEventListener("click", playLastChunk);
 if (stopPlaybackButton) {
@@ -1882,6 +2186,8 @@ window.addEventListener("resize", syncPlaybackSpectrumSize);
 appendEvent("Voice interface is ready.");
 logAudioCapabilities();
 syncControlButtons();
+loadLlmRuntimeConfig();
+refreshAutoloadStatus();
 refreshDeviceLists();
 startSystemLogPolling();
 if (navigator.mediaDevices && typeof navigator.mediaDevices.addEventListener === "function") {
@@ -1893,6 +2199,13 @@ if (systemLogPollIntervalInput) {
   systemLogPollIntervalInput.addEventListener("input", () => {
     renderSystemLogPollInterval();
     scheduleSystemLogPoll();
+  });
+}
+if (systemLogUpdateToggle) {
+  systemLogUpdateToggle.addEventListener("change", () => {
+    if (systemLogUpdateToggle.checked) {
+      fetchSystemLogSnapshot();
+    }
   });
 }
 if (temperatureInput) {
@@ -1909,4 +2222,9 @@ setCalibrationState("idle");
 renderTemperatureValue();
 stopPlaybackSpectrum();
 setPlaybackState("idle", "idle");
-refreshAutoloadStatus();
+if (autoloadToggle) {
+  autoloadToggle.disabled = true;
+}
+if (reasoningToggle) {
+  reasoningToggle.disabled = true;
+}

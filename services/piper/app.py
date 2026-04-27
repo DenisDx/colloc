@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import resource
 import wave
 from collections import defaultdict
 from pathlib import Path
@@ -122,10 +123,14 @@ def preload_model() -> dict[str, str]:
 @app.get("/metrics")
 def metrics() -> dict[str, object]:
     """Return service metrics. Output: metrics dict. Input: none."""
+    device_config = os.getenv("PIPER_DEVICE", "cpu").lower()
+    device = "gpu" if device_config in {"cuda", "gpu", "vram"} else "cpu"
     return {
         "service": "piper",
         "requests_total": REQUESTS_TOTAL,
         "requests_by_path": dict(REQUESTS_BY_PATH),
+        "memory_mb": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0, 2),
+        "device": device,
         "active_voice": _voice_id(),
         "cached_voices": sorted(_VOICE_CACHE.keys()),
     }

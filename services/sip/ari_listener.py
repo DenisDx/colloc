@@ -9,55 +9,17 @@ import base64
 import json
 import logging
 import os
-import time
 from dataclasses import dataclass
-from pathlib import Path
 from urllib.parse import urlencode
 
 import httpx
 import websockets
+from services.common.system_log import append_system_log, utc_timestamp
 from websockets.exceptions import ConnectionClosedError, InvalidStatus
 
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-
-def resolve_system_log_path() -> Path:
-    """Resolve writable system log path. Output: absolute path. Input: none."""
-    candidates: list[Path] = []
-    env_path = os.getenv("SYSTEM_LOG_PATH", "").strip()
-    if env_path:
-        candidates.append(Path(env_path))
-    candidates.extend(
-        [
-            Path("/srv/logs/system.log"),
-        ]
-    )
-
-    for path in candidates:
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.touch(exist_ok=True)
-            return path
-        except OSError:
-            continue
-
-    return candidates[0]
-
-
-SYSTEM_LOG_PATH = resolve_system_log_path()
-
-
-def append_system_log(component: str, event: str, message: str, details: dict | None = None) -> str:
-    """Append one system log line. Output: written text line. Input: component, event, message, optional details."""
-    timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    line = f"[{timestamp}] {component}.{event}: {message}"
-    if details:
-        line = f"{line} | {json.dumps(details, ensure_ascii=False)}"
-    with open(SYSTEM_LOG_PATH, "a", encoding="utf-8") as handle:
-        handle.write(f"{line}\n")
-    return line
 
 
 ASTERISK_HTTP_URL = os.getenv("ASTERISK_HTTP_URL", "http://asterisk:8088/ari").rstrip("/")
@@ -120,6 +82,7 @@ class AriListener:
         self.client = httpx.AsyncClient(auth=(ASTERISK_ARI_USER, ASTERISK_ARI_PASSWORD), timeout=10.0)
         self.calls_by_caller_channel: dict[str, ManagedCall] = {}
         self.calls_by_external_channel: dict[str, ManagedCall] = {}
+        self.destroy_causes_by_channel: dict[str, dict] = {}
         self.alloc = MediaPortAllocator(SIP_MEDIA_PORT_START, SIP_MEDIA_PORT_END)
 
     def _ws_url(self) -> str:
@@ -307,7 +270,19 @@ class AriListener:
     ) -> None:
         """Best-effort cleanup after setup failure. Output: none. Input: IDs and media port."""
         try:
-            await self._sip_post("/ari/call/end", {"channel_id": caller_channel_id})
+            await self._sip_post(
+                "/ari/call/end",
+                {
+                    "channel_id": caller_channel_id,
+                    "reason": "ari_setup_failed",
+                    "source": "AriListener._safe_cleanup",
+                    "bridge_id": bridge_id,
+                    "details": {
+                        "external_channel_id": external_channel_id,
+                        "media_port": media_port,
+                    },
+                },
+            )
         except Exception:
             pass
         for channel_id in (external_channel_id, caller_channel_id):
@@ -341,20 +316,80 @@ class AriListener:
         self.calls_by_external_channel.pop(managed.external_channel_id, None)
         self.calls_by_caller_channel.pop(managed.caller_channel_id, None)
 
-        logger.info("StasisEnd channel=%s caller=%s", channel_id, managed.caller_channel_id)
+        stasis_cause = event.get("cause")
+        stasis_cause_txt = str(event.get("cause_txt") or "").strip()
+
+        destroyed_caller = self.destroy_causes_by_channel.get(managed.caller_channel_id)
+        destroyed_external = self.destroy_causes_by_channel.get(managed.external_channel_id)
+        destroyed_current = self.destroy_causes_by_channel.get(channel_id)
+
+        logger.info(
+            "StasisEnd channel=%s caller=%s cause=%s cause_txt=%s",
+            channel_id,
+            managed.caller_channel_id,
+            stasis_cause,
+            stasis_cause_txt or "unknown",
+        )
         append_system_log(
             "sip",
             "ari_stop",
             "ARI call handling stopped.",
-            {"channel_id": channel_id, "caller_channel_id": managed.caller_channel_id, "bridge_id": managed.bridge_id},
+            {
+                "channel_id": channel_id,
+                "caller_channel_id": managed.caller_channel_id,
+                "bridge_id": managed.bridge_id,
+                "stasis_cause": stasis_cause,
+                "stasis_cause_txt": stasis_cause_txt or "unknown",
+                "destroyed_caller": destroyed_caller,
+                "destroyed_external": destroyed_external,
+                "destroyed_current": destroyed_current,
+            },
         )
 
+        stop_reason = "ari_stasis_end"
+        if stasis_cause is not None:
+            stop_reason = "ari_stasis_end_cause"
+        elif destroyed_current or destroyed_caller:
+            stop_reason = "ari_channel_destroyed"
+
+        cause = stasis_cause
+        cause_txt = stasis_cause_txt
+        if cause is None and destroyed_current:
+            cause = destroyed_current.get("cause")
+            cause_txt = str(destroyed_current.get("cause_txt") or cause_txt)
+        if cause is None and destroyed_caller:
+            cause = destroyed_caller.get("cause")
+            cause_txt = str(destroyed_caller.get("cause_txt") or cause_txt)
+
         try:
-            await self._sip_post("/ari/call/end", {"channel_id": managed.caller_channel_id})
+            await self._sip_post(
+                "/ari/call/end",
+                {
+                    "channel_id": managed.caller_channel_id,
+                    "reason": stop_reason,
+                    "source": "AriListener._handle_stasis_end",
+                    "cause": cause,
+                    "cause_txt": cause_txt or None,
+                    "ari_channel_id": channel_id,
+                    "bridge_id": managed.bridge_id,
+                    "details": {
+                        "external_channel_id": managed.external_channel_id,
+                        "destroyed_caller": destroyed_caller,
+                        "destroyed_external": destroyed_external,
+                        "destroyed_current": destroyed_current,
+                    },
+                },
+            )
         except Exception:
             logger.exception("Failed to notify sip-service about call end")
 
-        for doomed_channel in (managed.external_channel_id, managed.caller_channel_id):
+        # If the caller channel leaves Stasis because of dialplan continue/transfer,
+        # it must remain alive for Asterisk to keep processing the call.
+        doomed_channels = [managed.external_channel_id]
+        if channel_id != managed.caller_channel_id:
+            doomed_channels.append(managed.caller_channel_id)
+
+        for doomed_channel in doomed_channels:
             try:
                 await self._ari_delete(f"/channels/{doomed_channel}")
             except Exception:
@@ -366,6 +401,10 @@ class AriListener:
             pass
 
         await self.alloc.release(managed.media_port)
+
+        # Release cached destroy causes to avoid unbounded growth.
+        for doomed in (managed.caller_channel_id, managed.external_channel_id, channel_id):
+            self.destroy_causes_by_channel.pop(doomed, None)
 
     async def _handle_dtmf(self, event: dict) -> None:
         """Trigger barge-in on DTMF '#'. Output: none. Input: ARI event."""
@@ -395,15 +434,19 @@ class AriListener:
             return
 
         managed = self.calls_by_caller_channel.get(channel_id) or self.calls_by_external_channel.get(channel_id)
-        if not managed:
-            return
+        caller_channel_id = managed.caller_channel_id if managed else "unknown"
 
         cause = event.get("cause")
         cause_txt = str(event.get("cause_txt") or "")
+        self.destroy_causes_by_channel[channel_id] = {
+            "cause": cause,
+            "cause_txt": cause_txt or "unknown",
+            "timestamp": utc_timestamp(),
+        }
         logger.info(
             "ChannelDestroyed channel=%s caller=%s cause=%s cause_txt=%s",
             channel_id,
-            managed.caller_channel_id,
+            caller_channel_id,
             cause,
             cause_txt or "unknown",
         )
@@ -411,7 +454,13 @@ class AriListener:
             "sip",
             "ari_channel_destroyed",
             "ARI channel destroyed event received.",
-            {"channel_id": channel_id, "caller_channel_id": managed.caller_channel_id, "cause": cause, "cause_txt": cause_txt or "unknown"},
+            {
+                "channel_id": channel_id,
+                "caller_channel_id": caller_channel_id,
+                "cause": cause,
+                "cause_txt": cause_txt or "unknown",
+                "managed": bool(managed),
+            },
         )
 
     async def handle_event(self, event: dict) -> None:

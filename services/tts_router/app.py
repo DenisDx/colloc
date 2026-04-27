@@ -1,10 +1,12 @@
 import os
+import re
 import resource
 from collections import defaultdict
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
+from num2words import num2words
 from pydantic import BaseModel, Field
 
 
@@ -131,6 +133,106 @@ def language_to_speech_locale(language: str) -> str:
     return mapping.get(language.upper(), "en-US")
 
 
+def verbalize_non_letters(text: str, language: str) -> str:
+    """Verbalize non-letter tokens by segment language. Output: transformed text. Input: text and language."""
+    lang = (language or "EN").upper()
+    digit_names = {
+        "RU": {
+            "0": "ноль",
+            "1": "один",
+            "2": "два",
+            "3": "три",
+            "4": "четыре",
+            "5": "пять",
+            "6": "шесть",
+            "7": "семь",
+            "8": "восемь",
+            "9": "девять",
+        },
+        "EN": {
+            "0": "zero",
+            "1": "one",
+            "2": "two",
+            "3": "three",
+            "4": "four",
+            "5": "five",
+            "6": "six",
+            "7": "seven",
+            "8": "eight",
+            "9": "nine",
+        },
+    }
+    symbol_names = {
+        "RU": {
+            "*": "звездочка",
+            "#": "решетка",
+            "+": "плюс",
+            "=": "равно",
+            "/": "слэш",
+            "\\": "обратный слэш",
+            "@": "собака",
+            "&": "амперсанд",
+            "%": "процент",
+            "$": "доллар",
+            "€": "евро",
+            "£": "фунт",
+            "§": "параграф",
+            "№": "номер",
+        },
+        "EN": {
+            "*": "asterisk",
+            "#": "hash",
+            "+": "plus",
+            "=": "equals",
+            "/": "slash",
+            "\\": "backslash",
+            "@": "at",
+            "&": "ampersand",
+            "%": "percent",
+            "$": "dollar",
+            "€": "euro",
+            "£": "pound",
+            "§": "section",
+            "№": "number",
+        },
+    }
+    pause_punctuation = {".", ",", "!", "?", ":", ";", "…"}
+
+    active_digit_names = digit_names.get(lang, digit_names["EN"])
+    active_symbol_names = symbol_names.get(lang, symbol_names["EN"])
+    num2words_lang = "ru" if lang == "RU" else "en"
+
+    # Normalize inline minus/hyphen usage so TTS reads it as punctuation pause.
+    result = re.sub(r"(?<=\S)-(?=\S)", " - ", text)
+
+    # Replace digit runs with language-specific words while preserving original words.
+    def _replace_digits(match: re.Match[str]) -> str:
+        digits = match.group(0)
+
+        # For 4 or fewer digits, try full number pronunciation.
+        # Keep digit-by-digit fallback for unsupported cases and errors.
+        if len(digits) <= 4 and not (len(digits) > 1 and digits.startswith("0")):
+            try:
+                return f" {num2words(int(digits), lang=num2words_lang)} "
+            except Exception:
+                pass
+
+        return " " + " ".join(active_digit_names.get(ch, ch) for ch in digits) + " "
+
+    result = re.sub(r"\d+", _replace_digits, result)
+
+    # Replace configured symbols with spoken forms, but keep pause punctuation intact.
+    escaped_symbols = "".join(re.escape(sym) for sym in active_symbol_names.keys() if sym not in pause_punctuation)
+    if escaped_symbols:
+        symbol_re = re.compile(f"[{escaped_symbols}]")
+        result = symbol_re.sub(lambda m: f" {active_symbol_names.get(m.group(0), m.group(0))} ", result)
+
+    # Normalize extra spaces created by replacements.
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    result = re.sub(r"\s+([.,!?:;…])", r"\1", result)
+    return result.strip()
+
+
 def split_text_by_language(text: str) -> list[dict[str, str]]:
     """Split text into language-homogeneous segments. Output: segment list. Input: source text."""
     if not text.strip():
@@ -160,7 +262,33 @@ def split_text_by_language(text: str) -> list[dict[str, str]]:
     if tail:
         segments.append({"language": current_language, "text": tail})
 
-    return [s for s in segments if s["text"]]
+    segments = [s for s in segments if s["text"]]
+
+    # Forward pass: digits/symbols inherit the language of the preceding block.
+    last_known = "OTHER"
+    for seg in segments:
+        if seg["language"] != "OTHER":
+            last_known = seg["language"]
+        elif last_known != "OTHER":
+            seg["language"] = last_known
+
+    # Backward pass: leading digits/symbols inherit language from the first following block.
+    last_known_rev = "OTHER"
+    for seg in reversed(segments):
+        if seg["language"] != "OTHER":
+            last_known_rev = seg["language"]
+        elif last_known_rev != "OTHER":
+            seg["language"] = last_known_rev
+
+    # Merge adjacent same-language segments produced by the resolution above.
+    merged: list[dict[str, str]] = []
+    for seg in segments:
+        if merged and merged[-1]["language"] == seg["language"]:
+            merged[-1]["text"] = merged[-1]["text"] + " " + seg["text"]
+        else:
+            merged.append({"language": seg["language"], "text": seg["text"]})
+
+    return merged
 
 
 def get_memory_usage_mb() -> float:
@@ -276,11 +404,12 @@ async def synthesize(request: SynthesisRequest) -> dict[str, object]:
     for seg in raw_segments:
         lang = seg["language"] if seg["language"] in configured_langs else "EN"
         cfg = get_lang_config(lang)
+        normalized_text = verbalize_non_letters(seg["text"], lang)
         planned_segments.append(
             {
                 "language": lang,
                 "locale": language_to_speech_locale(lang),
-                "text": seg["text"],
+                "text": normalized_text,
                 "primary_provider": cfg["primary"]["provider"],
                 "fallback_provider": cfg["fallback"]["provider"],
             }

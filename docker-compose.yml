@@ -89,6 +89,13 @@ services:
     depends_on:
       redis:
         condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     command:
       - /opt/venv/bin/uvicorn
       - webui.backend.app:app
@@ -342,6 +349,13 @@ services:
     profiles:
       - tts
       - tts-silero
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
       PYTHONPATH: /app
       VIRTUAL_ENV: /opt/venv
@@ -349,6 +363,7 @@ services:
       SYSTEM_LOG_PATH: /srv/logs/system.log
       TMPDIR: /srv/data/tmp
       SILERO_MODEL_DIR: /srv/data/silero-models
+      SILERO_DEVICE: ${SILERO_DEVICE}
     command:
       - /opt/venv/bin/uvicorn
       - services.silero.app:app
@@ -473,10 +488,12 @@ services:
       - ./asterisk/etc/http.conf:/etc/asterisk/http.conf:ro
       - ./asterisk/etc/extensions.conf:/etc/asterisk/extensions.conf:ro
       - ./asterisk/etc/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk/etc/acl.conf:/etc/asterisk/acl.conf:ro
       - ./asterisk/etc/stasis.conf:/etc/asterisk/stasis.conf:ro
       - ./asterisk/etc/modules.conf:/etc/asterisk/modules.conf:ro
       - ./asterisk/etc/rtp.conf:/etc/asterisk/rtp.conf:ro
     ports:
+      - "5060:5060/udp"
       - ${ASTERISK_PJSIP_PORT}:${ASTERISK_PJSIP_PORT}/udp
       - ${ASTERISK_RTP_START}-${ASTERISK_RTP_END}:${ASTERISK_RTP_START}-${ASTERISK_RTP_END}/udp
     healthcheck:
